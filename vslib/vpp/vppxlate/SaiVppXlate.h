@@ -328,6 +328,10 @@ typedef enum {
     extern int create_bvi_interface(uint8_t *mac_address, uint32_t instance);
     extern int delete_bvi_interface(const char *hwif_name);
     extern int set_bridge_domain_flags(uint32_t bd_id, vpp_bd_flags_t flag, bool enable);
+
+    extern int bd_ip_mac_add_del(uint32_t bd_id, int af,
+				 const void *ip_addr, size_t ip_len,
+				 const uint8_t *mac, bool is_add);
     extern int create_bond_interface(uint32_t bond_id, uint32_t mode, uint32_t lb, uint32_t *swif_idx);
     extern int delete_bond_interface(const char *hwif_name);
     extern int create_bond_member(uint32_t bond_sw_if_index, const char *hwif_name, bool is_passive, bool is_long_timeout);

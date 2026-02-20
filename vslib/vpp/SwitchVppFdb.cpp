@@ -444,6 +444,14 @@ sai_status_t SwitchVpp::vpp_create_bvi_interface(
     uint32_t bd_id = (uint32_t) vlan_id;
     set_bridge_domain_flags(bd_id, VPP_BD_FLAG_ARP_TERM,true);
 
+    /*
+     * NOTE: BVI LCP pair creation is deferred. VPP's configure_lcp_interface
+     * tries to create a new tap device named "Vlan<N>", but that interface
+     * already exists in the Linux kernel (created by SONiC bridge/VLAN
+     * subsystem). VPP's tap_create_if fails with TUNSETIFF: Invalid argument.
+     * A different punt/inject mechanism is needed for BVI ↔ kernel Vlan.
+     */
+
     return SAI_STATUS_SUCCESS;
 }
 

@@ -981,6 +981,15 @@ vl_api_l2_fib_table_details_t_handler (vl_api_l2_fib_table_details_t *mp)
 }
 
 static void
+vl_api_bd_ip_mac_add_del_reply_t_handler (vl_api_bd_ip_mac_add_del_reply_t *msg)
+{
+    int retval = (int)ntohl((uint32_t)msg->retval);
+    set_reply_status(retval);
+
+    SAIVPP_DEBUG("bd_ip_mac_add_del reply handler %s(%d)", retval ? "failed" : "successful", retval);
+}
+
+static void
 vl_api_bfd_udp_add_reply_t_handler (vl_api_bfd_udp_add_reply_t *msg)
 {
     int retval = (int)ntohl((uint32_t)msg->retval);
@@ -1353,6 +1362,7 @@ static void vpp_base_vpe_init(void)
     _(L2_MSG_ID(L2_FIB_TABLE_DETAILS), l2_fib_table_details) \
     _(L2_MSG_ID(L2_MACS_EVENT), l2_macs_event) \
     _(L2_MSG_ID(WANT_L2_MACS_EVENTS2_REPLY), want_l2_macs_events2_reply) \
+    _(L2_MSG_ID(BD_IP_MAC_ADD_DEL_REPLY), bd_ip_mac_add_del_reply) \
     _(BFD_MSG_ID(BFD_UDP_ADD_REPLY), bfd_udp_add_reply) \
     _(BFD_MSG_ID(BFD_UDP_DEL_REPLY), bfd_udp_del_reply) \
     _(BFD_MSG_ID(BFD_UDP_SESSION_EVENT), bfd_udp_session_event) \
@@ -3175,6 +3185,46 @@ int set_bridge_domain_flags(uint32_t bd_id, vpp_bd_flags_t flag, bool enable)
     mp->bd_id = htonl(bd_id);
     mp->is_set = enable;
     mp->flags = htonl(flag);
+    S (mp);
+
+    W (ret);
+
+    VPP_UNLOCK();
+
+    return ret;
+}
+
+int bd_ip_mac_add_del(uint32_t bd_id, int af,
+		      const void *ip_addr, size_t ip_len,
+		      const uint8_t *mac, bool is_add)
+{
+    vat_main_t *vam = &vat_main;
+    vl_api_bd_ip_mac_add_del_t *mp;
+    int ret;
+
+    SAIVPP_WARN("bd_ip_mac_add_del bd:%d is_add:%d\n", bd_id, is_add);
+    VPP_LOCK();
+
+    __plugin_msg_base = l2_msg_id_base;
+
+    M (BD_IP_MAC_ADD_DEL, mp);
+
+    mp->is_add = is_add;
+    mp->entry.bd_id = htonl(bd_id);
+
+    if (af == AF_INET) {
+        mp->entry.ip.af = ADDRESS_IP4;
+        memcpy(mp->entry.ip.un.ip4, ip_addr, sizeof(mp->entry.ip.un.ip4));
+    } else if (af == AF_INET6) {
+        mp->entry.ip.af = ADDRESS_IP6;
+        memcpy(mp->entry.ip.un.ip6, ip_addr, sizeof(mp->entry.ip.un.ip6));
+    } else {
+        VPP_UNLOCK();
+        return -EINVAL;
+    }
+
+    memcpy(mp->entry.mac, mac, sizeof(mp->entry.mac));
+
     S (mp);
 
     W (ret);
