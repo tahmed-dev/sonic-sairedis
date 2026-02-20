@@ -279,6 +279,19 @@ sai_status_t SwitchVpp::vpp_remove_vlan_member(
 
     const char *hw_ifname = nullptr;
     auto br_port_attrs = m_objectHash.at(SAI_OBJECT_TYPE_BRIDGE_PORT).at(sai_serialize_object_id(br_port_oid));
+
+    /* Check bridge port type — skip TUNNEL ports (VxLAN), they don't have
+       SAI_BRIDGE_PORT_ATTR_PORT_ID and would segfault on dereference. */
+    auto bp_type_meta = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_TYPE);
+    auto bp_type_attr = br_port_attrs[bp_type_meta->attridname];
+
+    if (bp_type_attr && bp_type_attr->getAttr()->value.s32 == SAI_BRIDGE_PORT_TYPE_TUNNEL)
+    {
+        SWSS_LOG_NOTICE("Skipping vlan member remove for TUNNEL bridge port %s",
+                sai_serialize_object_id(br_port_oid).c_str());
+        return SAI_STATUS_SUCCESS;
+    }
+
     auto meta = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_PORT_ID);
     auto bp_attr = br_port_attrs[meta->attridname];
     auto port_id = bp_attr->getAttr()->value.oid;
@@ -998,6 +1011,22 @@ sai_status_t SwitchVpp::vpp_fdbentry_add(
     }
 
     auto br_port_attrs = m_objectHash.at(SAI_OBJECT_TYPE_BRIDGE_PORT).at(sai_serialize_object_id(br_port_id));
+
+    /* Check bridge port type — tunnel bridge ports don't have PORT_ID,
+     * they have TUNNEL_ID. Skip VPP FDB ops for tunnel ports. */
+    {
+        auto meta_bp_type = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_TYPE);
+        auto it_bp_type = br_port_attrs.find(meta_bp_type->attridname);
+        if (it_bp_type != br_port_attrs.end()) {
+            sai_bridge_port_type_t bp_type = (sai_bridge_port_type_t)it_bp_type->second->getAttr()->value.s32;
+            if (bp_type == SAI_BRIDGE_PORT_TYPE_TUNNEL) {
+                SWSS_LOG_NOTICE("vpp_fdbentry_add: Skipping VPP FDB ops for tunnel bridge port %s",
+                    sai_serialize_object_id(br_port_id).c_str());
+                return SAI_STATUS_SUCCESS;
+            }
+        }
+    }
+
     auto meta = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_PORT_ID);
     auto bp_attr = br_port_attrs[meta->attridname];
     port_id = bp_attr->getAttr()->value.oid;
@@ -1105,6 +1134,21 @@ sai_status_t SwitchVpp::vpp_fdbentry_del(
     }
 
     auto br_port_attrs = m_objectHash.at(SAI_OBJECT_TYPE_BRIDGE_PORT).at(sai_serialize_object_id(br_port_id));
+
+    /* Check bridge port type — tunnel bridge ports don't have PORT_ID. */
+    {
+        auto meta_bp_type = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_TYPE);
+        auto it_bp_type = br_port_attrs.find(meta_bp_type->attridname);
+        if (it_bp_type != br_port_attrs.end()) {
+            sai_bridge_port_type_t bp_type = (sai_bridge_port_type_t)it_bp_type->second->getAttr()->value.s32;
+            if (bp_type == SAI_BRIDGE_PORT_TYPE_TUNNEL) {
+                SWSS_LOG_NOTICE("vpp_fdbentry_remove: Skipping VPP FDB ops for tunnel bridge port %s",
+                    sai_serialize_object_id(br_port_id).c_str());
+                return SAI_STATUS_SUCCESS;
+            }
+        }
+    }
+
     auto meta = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_PORT_ID);
     auto bp_attr = br_port_attrs[meta->attridname];
     port_id = bp_attr->getAttr()->value.oid;
@@ -1225,6 +1269,19 @@ sai_status_t SwitchVpp::vpp_fdbentry_flush(
         case FLUSH_BY_INTERFACE | FLUSH_ALL:/*flush by interface*/
             {
                 auto br_port_attrs = m_objectHash.at(SAI_OBJECT_TYPE_BRIDGE_PORT).at(sai_serialize_object_id(br_port_id));
+
+                /* Check bridge port type — tunnel bridge ports don't have PORT_ID. */
+                auto meta_bp_type = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_TYPE);
+                auto it_bp_type = br_port_attrs.find(meta_bp_type->attridname);
+                if (it_bp_type != br_port_attrs.end()) {
+                    sai_bridge_port_type_t bp_type = (sai_bridge_port_type_t)it_bp_type->second->getAttr()->value.s32;
+                    if (bp_type == SAI_BRIDGE_PORT_TYPE_TUNNEL) {
+                        SWSS_LOG_NOTICE("vpp_fdb_flush: Skipping flush for tunnel bridge port %s",
+                            sai_serialize_object_id(br_port_id).c_str());
+                        return SAI_STATUS_SUCCESS;
+                    }
+                }
+
                 auto meta = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_PORT_ID);
                 auto bp_attr = br_port_attrs[meta->attridname];
                 port_id = bp_attr->getAttr()->value.oid;
