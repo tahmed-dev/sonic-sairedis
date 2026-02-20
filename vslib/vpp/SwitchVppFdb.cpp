@@ -1058,9 +1058,9 @@ sai_status_t SwitchVpp::vpp_fdbentry_add(
     port_id = bp_attr->getAttr()->value.oid;
     obj_type = objectTypeQuery(port_id);
 
-    if (obj_type != SAI_OBJECT_TYPE_PORT)
+    if (obj_type != SAI_OBJECT_TYPE_PORT && obj_type != SAI_OBJECT_TYPE_LAG)
     {
-        SWSS_LOG_NOTICE("SAI_BRIDGE_PORT_ATTR_PORT_ID=%s expected to be PORT but is: %s",
+        SWSS_LOG_NOTICE("SAI_BRIDGE_PORT_ATTR_PORT_ID=%s expected to be PORT or LAG but is: %s",
                 sai_serialize_object_id(port_id).c_str(),
                 sai_serialize_object_type(obj_type).c_str());
         return SAI_STATUS_FAILURE;
@@ -1070,30 +1070,61 @@ sai_status_t SwitchVpp::vpp_fdbentry_add(
     sai_attribute_t attr;
     attr.id = SAI_PORT_ATTR_PORT_VLAN_ID;
 
-    sai_status_t get_status = get(SAI_OBJECT_TYPE_PORT, port_id, 1, &attr);
-
-    if (get_status != SAI_STATUS_SUCCESS)
-    {
-        SWSS_LOG_ERROR("failed to get port vlan id from port %s",
-                sai_serialize_object_id(port_id).c_str());
-        return SAI_STATUS_FAILURE;
-    }
-
-    uint32_t bd_id = attr.value.u16; /* bd_id is same as VLAN ID for .1Q bridge */
-
+    uint32_t bd_id;
     std::string ifname;
-    if (vpp_get_hwif_name(port_id, 0, ifname) == true)
-    {
-        const char *hwif_name = ifname.c_str();
-        auto ret = l2fib_add_del(hwif_name, fdb_entry.mac_address, bd_id, is_add, is_static);
-        SWSS_LOG_NOTICE("FDB Entry Added on hwif_name %s Successful ret_val: %d", hwif_name, ret);
+    const char *hwif_name = nullptr;
 
+    if (obj_type == SAI_OBJECT_TYPE_PORT)
+    {
+        sai_status_t get_status = get(SAI_OBJECT_TYPE_PORT, port_id, 1, &attr);
+        if (get_status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("failed to get port vlan id from port %s",
+                    sai_serialize_object_id(port_id).c_str());
+            return SAI_STATUS_FAILURE;
+        }
+        bd_id = attr.value.u16;
+
+        if (!vpp_get_hwif_name(port_id, 0, ifname))
+        {
+            SWSS_LOG_ERROR("FDB_ENTRY failed because of INVALID PORT_ID");
+            return SAI_STATUS_FAILURE;
+        }
+        hwif_name = ifname.c_str();
     }
-    else
+    else /* SAI_OBJECT_TYPE_LAG */
     {
-        SWSS_LOG_ERROR("FDB_ENTRY failed because of INVALID PORT_ID");
+        platform_bond_info_t bond_info;
+        CHECK_STATUS(get_lag_bond_info(port_id, bond_info));
+        bd_id = fdb_entry.bv_id ? 10 : 10; /* Use bridge VLAN from FDB entry */
+        /* Get VLAN from the LAG's bridge port membership */
+        auto meta_vlan = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_VLAN_ID);
+        auto it_vlan = br_port_attrs.find(meta_vlan->attridname);
+        if (it_vlan != br_port_attrs.end()) {
+            bd_id = it_vlan->second->getAttr()->value.u16;
+        } else {
+            /* Fallback: extract VLAN from the FDB entry's bridge ID */
+            sai_object_id_t bv_id = fdb_entry.bv_id;
+            sai_attribute_t vlan_attr;
+            vlan_attr.id = SAI_VLAN_ATTR_VLAN_ID;
+            if (get(SAI_OBJECT_TYPE_VLAN, bv_id, 1, &vlan_attr) == SAI_STATUS_SUCCESS) {
+                bd_id = vlan_attr.value.u16;
+            }
+        }
 
-        return SAI_STATUS_FAILURE;
+        hwif_name = vpp_get_swif_name(bond_info.sw_if_index);
+        if (hwif_name == nullptr) {
+            SWSS_LOG_ERROR("FDB_ENTRY failed: LAG sw_if_index %u not found", bond_info.sw_if_index);
+            return SAI_STATUS_FAILURE;
+        }
+        SWSS_LOG_NOTICE("FDB entry on LAG %s (sw_if=%u, bd=%u)",
+                hwif_name, bond_info.sw_if_index, bd_id);
+    }
+
+    {
+        auto ret = l2fib_add_del(hwif_name, fdb_entry.mac_address, bd_id, is_add, is_static);
+        SWSS_LOG_NOTICE("FDB Entry %s on hwif_name %s bd=%u ret_val: %d",
+                is_add ? "Added" : "Deleted", hwif_name, bd_id, ret);
     }
 
     return SAI_STATUS_SUCCESS;
@@ -1180,44 +1211,71 @@ sai_status_t SwitchVpp::vpp_fdbentry_del(
     port_id = bp_attr->getAttr()->value.oid;
     obj_type = objectTypeQuery(port_id);
 
-    if (obj_type != SAI_OBJECT_TYPE_PORT)
+    if (obj_type != SAI_OBJECT_TYPE_PORT && obj_type != SAI_OBJECT_TYPE_LAG)
     {
-        SWSS_LOG_ERROR("SAI_BRIDGE_PORT_ATTR_PORT_ID=%s expected to be PORT but is: %s",
+        SWSS_LOG_ERROR("SAI_BRIDGE_PORT_ATTR_PORT_ID=%s expected to be PORT or LAG but is: %s",
                 sai_serialize_object_id(port_id).c_str(),
                 sai_serialize_object_type(obj_type).c_str());
         return SAI_STATUS_FAILURE;
     }
 
     /* Need the VLAN ID attached based on the Port_ID */
-    sai_attribute_t attr;
-    attr.id = SAI_PORT_ATTR_PORT_VLAN_ID;
-
-    sai_status_t get_status = get(SAI_OBJECT_TYPE_PORT, port_id, 1, &attr);
-
-    if (get_status != SAI_STATUS_SUCCESS)
-    {
-        SWSS_LOG_ERROR("failed to get port vlan id from port %s",
-                sai_serialize_object_id(port_id).c_str());
-        return SAI_STATUS_FAILURE;
-    }
-
-    uint32_t bd_id = attr.value.u16; /* bd_id is same as VLAN ID for .1Q bridge */
-
+    uint32_t bd_id;
     std::string ifname;
+    const char *hwif_name = nullptr;
 
-    if (vpp_get_hwif_name(port_id, 0, ifname) == true)
+    if (obj_type == SAI_OBJECT_TYPE_PORT)
     {
-        const char *hwif_name = ifname.c_str();
+        sai_attribute_t attr;
+        attr.id = SAI_PORT_ATTR_PORT_VLAN_ID;
+        sai_status_t get_status = get(SAI_OBJECT_TYPE_PORT, port_id, 1, &attr);
+        if (get_status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("failed to get port vlan id from port %s",
+                    sai_serialize_object_id(port_id).c_str());
+            return SAI_STATUS_FAILURE;
+        }
+        bd_id = attr.value.u16;
+
+        if (!vpp_get_hwif_name(port_id, 0, ifname))
+        {
+            SWSS_LOG_ERROR("FDB entry Delete: Invalid ObjectID for the hwif on this bridge");
+            return SAI_STATUS_FAILURE;
+        }
+        hwif_name = ifname.c_str();
+    }
+    else /* SAI_OBJECT_TYPE_LAG */
+    {
+        platform_bond_info_t bond_info;
+        CHECK_STATUS(get_lag_bond_info(port_id, bond_info));
+        /* Get VLAN from bridge port membership or FDB entry */
+        auto meta_vlan = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_VLAN_ID);
+        auto it_vlan = br_port_attrs.find(meta_vlan->attridname);
+        if (it_vlan != br_port_attrs.end()) {
+            bd_id = it_vlan->second->getAttr()->value.u16;
+        } else {
+            sai_object_id_t bv_id = fdb_entry.bv_id;
+            sai_attribute_t vlan_attr;
+            vlan_attr.id = SAI_VLAN_ATTR_VLAN_ID;
+            if (get(SAI_OBJECT_TYPE_VLAN, bv_id, 1, &vlan_attr) == SAI_STATUS_SUCCESS) {
+                bd_id = vlan_attr.value.u16;
+            } else {
+                bd_id = 10; /* Last resort fallback */
+            }
+        }
+
+        hwif_name = vpp_get_swif_name(bond_info.sw_if_index);
+        if (hwif_name == nullptr) {
+            SWSS_LOG_ERROR("FDB Delete: LAG sw_if_index %u not found", bond_info.sw_if_index);
+            return SAI_STATUS_FAILURE;
+        }
+    }
+
+    {
         auto ret = l2fib_add_del(hwif_name, fdb_entry.mac_address, bd_id, is_add, is_static);
-        SWSS_LOG_NOTICE(" Delete FDB_ENTRY on hwif_name %s Successful ret_val: %d", hwif_name, ret);
-
+        SWSS_LOG_NOTICE("Delete FDB_ENTRY on hwif_name %s bd=%u ret_val: %d", hwif_name, bd_id, ret);
     }
-    else
-    {
-        SWSS_LOG_ERROR("FDB entry Delete: Invalid ObjectID for the hwif on this bridge");
 
-        return SAI_STATUS_FAILURE;
-    }
     return SAI_STATUS_SUCCESS;
 }
 
