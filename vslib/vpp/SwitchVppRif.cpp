@@ -1077,6 +1077,35 @@ sai_status_t SwitchVpp::vpp_add_del_intf_ip_addr_norif (
         }
     }
 
+    /*
+     * Mirror the BVI IP onto the kernel VLAN sub-interface (bvivlan<N>.<N>)
+     * used by the LCP punt path.  Packets punted from VPP arrive on this
+     * sub-interface with the VLAN tag stripped, so the kernel needs a matching
+     * IP address to accept and respond to them (ICMP, TCP, etc.).
+     */
+    if (full_if_name.compare(0, vlan_prefix.length(), vlan_prefix) == 0 && vlan_id > 0)
+    {
+        char cmd[256];
+        if (m_ip.getIp().family == AF_INET) {
+            char ip_str[INET_ADDRSTRLEN];
+            uint32_t ip4 = m_ip.getV4Addr();
+            inet_ntop(AF_INET, &ip4, ip_str, sizeof(ip_str));
+            snprintf(cmd, sizeof(cmd), "ip addr %s %s/%d dev bvivlan%u.%u 2>/dev/null",
+                     is_add ? "add" : "del", ip_str, intf_ip_prefix.getMaskLength(), vlan_id, vlan_id);
+        } else {
+            char ip_str[INET6_ADDRSTRLEN];
+            const uint8_t *ip6 = m_ip.getV6Addr();
+            inet_ntop(AF_INET6, ip6, ip_str, sizeof(ip_str));
+            snprintf(cmd, sizeof(cmd), "ip addr %s %s/%d dev bvivlan%u.%u 2>/dev/null",
+                     is_add ? "add" : "del", ip_str, intf_ip_prefix.getMaskLength(), vlan_id, vlan_id);
+        }
+        if (system(cmd) != 0) {
+            SWSS_LOG_WARN("Failed to update IP on bvivlan%u.%u", vlan_id, vlan_id);
+        }
+        SWSS_LOG_NOTICE("BVI punt sub-interface IP %s on bvivlan%u.%u",
+                        is_add ? "added" : "removed", vlan_id, vlan_id);
+    }
+
     if (ret != 0)
     {
         SWSS_LOG_ERROR("interface_ip_address_add_del failed for %s (ret=%d)", hw_ifname, ret);

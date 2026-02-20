@@ -455,15 +455,42 @@ sai_status_t SwitchVpp::vpp_create_bvi_interface(
 
     //Set the arp termination for bridge
     uint32_t bd_id = (uint32_t) vlan_id;
-    set_bridge_domain_flags(bd_id, VPP_BD_FLAG_ARP_TERM,true);
+    set_bridge_domain_flags(bd_id, VPP_BD_FLAG_ARP_TERM, true);
 
     /*
-     * NOTE: BVI LCP pair creation is deferred. VPP's configure_lcp_interface
-     * tries to create a new tap device named "Vlan<N>", but that interface
-     * already exists in the Linux kernel (created by SONiC bridge/VLAN
-     * subsystem). VPP's tap_create_if fails with TUNSETIFF: Invalid argument.
-     * A different punt/inject mechanism is needed for BVI ↔ kernel Vlan.
+     * Create an LCP pair for the BVI so that L3 traffic destined to the BVI's
+     * IP can be punted to the Linux kernel (ICMP, TCP, ARP replies, etc.).
+     *
+     * We cannot use "Vlan<N>" as the host interface name because SONiC's
+     * bridge/VLAN subsystem already creates that interface.  Use "bvivlan<N>"
+     * instead.  VPP's DVR punt redirect is set up automatically by the LCP
+     * plugin.
+     *
+     * The DVR reinject preserves the VLAN tag from the BD tag-rewrite, so we
+     * also create a kernel VLAN sub-interface (bvivlan<N>.<N>) to strip it.
      */
+    {
+        char bvi_ifname[32], host_ifname[32];
+        snprintf(bvi_ifname,  sizeof(bvi_ifname),  "bvi%u",      vlan_id);
+        snprintf(host_ifname, sizeof(host_ifname),  "bvivlan%u",  vlan_id);
+
+        SWSS_LOG_NOTICE("Creating LCP pair for BVI: %s -> %s", bvi_ifname, host_ifname);
+        configure_lcp_interface(bvi_ifname, host_ifname, true);
+
+        /* Create kernel VLAN sub-interface and bring both up */
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd),
+                 "ip link add link %s name %s.%u type vlan id %u 2>/dev/null; "
+                 "ip link set %s up; "
+                 "ip link set %s.%u up",
+                 host_ifname, host_ifname, vlan_id, vlan_id,
+                 host_ifname,
+                 host_ifname, vlan_id);
+        if (system(cmd) != 0) {
+            SWSS_LOG_WARN("Failed to create kernel VLAN sub-interface %s.%u", host_ifname, vlan_id);
+        }
+        SWSS_LOG_NOTICE("Created kernel VLAN sub-interface %s.%u", host_ifname, vlan_id);
+    }
 
     return SAI_STATUS_SUCCESS;
 }
