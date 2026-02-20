@@ -385,6 +385,7 @@ void SwitchVpp::vppProcessEvents ()
     const struct timespec req = {2, 0};
     vpp_event_info_t *evp;
     int ret;
+    uint32_t fdb_poll_counter = 0;
 
     while(m_run_vpp_events_thread) {
         nanosleep(&req, NULL);
@@ -404,8 +405,21 @@ void SwitchVpp::vppProcessEvents ()
                                 evp->data.bfd_notif.sw_if_index,
                                 evp->data.bfd_notif.state);
                 asyncBfdStateUpdate(&evp->data.bfd_notif);
+            } else if (evp->type == VPP_L2_MAC_EVENT) {
+                SWSS_LOG_NOTICE("Received L2 MAC event: %u MACs",
+                                evp->data.l2_mac_event.n_macs);
+                vppProcessL2MacEvent(&evp->data.l2_mac_event);
             }
             vpp_ev_free(evp);
+        }
+
+        /* Periodic FDB poll as fallback — catches MACs that events may miss
+         * (e.g., MACs learned before event subscription was active).
+         * Runs every ~30 seconds (15 iterations * 2s sleep). */
+        fdb_poll_counter++;
+        if (fdb_poll_counter >= 15) {
+            fdb_poll_counter = 0;
+            vppPollFdb();
         }
     }
 }

@@ -127,14 +127,37 @@ extern "C" {
         vpp_api_bfd_state_e state;
     } vpp_bfd_state_notif_t;
 
+    /* L2 MAC event from VPP l2fib */
+    typedef enum {
+        VPP_L2_MAC_EVENT_ACTION_ADD = 0,
+        VPP_L2_MAC_EVENT_ACTION_DELETE = 1,
+        VPP_L2_MAC_EVENT_ACTION_MOVE = 2,
+    } vpp_l2_mac_event_action_e;
+
+    #define VPP_L2_MAC_EVENT_MAX_MACS 64
+
+    typedef struct vpp_l2_mac_event_entry_ {
+        uint32_t sw_if_index;
+        uint8_t mac[6];
+        uint8_t action; /* vpp_l2_mac_event_action_e */
+        uint8_t flags;
+    } vpp_l2_mac_event_entry_t;
+
+    typedef struct vpp_l2_mac_event_ {
+        uint32_t n_macs;
+        vpp_l2_mac_event_entry_t entries[VPP_L2_MAC_EVENT_MAX_MACS];
+    } vpp_l2_mac_event_t;
+
     typedef enum {
 	VPP_INTF_LINK_STATUS = 1,
         VPP_BFD_STATE_CHANGE,
+        VPP_L2_MAC_EVENT,
     } vpp_event_type_e;
 
     typedef union vpp_event_data_ {
        vpp_intf_status_t     intf_status;
        vpp_bfd_state_notif_t bfd_notif;
+       vpp_l2_mac_event_t    l2_mac_event;
     } vpp_event_data_t;
 
     typedef struct vpp_my_sid_entry_ {
@@ -314,6 +337,27 @@ typedef enum {
     extern int l2fib_flush_all();
     extern int l2fib_flush_int(const char *hwif_name);
     extern int l2fib_flush_bd(uint32_t bd_id);
+
+    /* L2 FIB table dump for MAC learning events */
+    #define VPP_L2FIB_MAX_ENTRIES 4096
+
+    typedef struct vpp_l2fib_entry_ {
+        uint32_t bd_id;
+        uint8_t mac[6];
+        uint32_t sw_if_index;
+        bool static_mac;
+        bool filter_mac;
+        bool bvi_mac;
+    } vpp_l2fib_entry_t;
+
+    typedef struct vpp_l2fib_dump_result_ {
+        vpp_l2fib_entry_t entries[VPP_L2FIB_MAX_ENTRIES];
+        uint32_t count;
+    } vpp_l2fib_dump_result_t;
+
+    extern int l2fib_table_dump(uint32_t bd_id, vpp_l2fib_dump_result_t *result);
+
+    extern int l2_macs_events_enable_disable(bool enable, uint8_t max_macs_in_event);
     extern int bfd_udp_add(bool multihop, const char *hwif_name, vpp_ip_addr_t *local_addr,
                            vpp_ip_addr_t *peer_addr, uint8_t detect_mult,
                            uint32_t desired_min_tx, uint32_t required_min_rx);

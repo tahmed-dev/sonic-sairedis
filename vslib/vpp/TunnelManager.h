@@ -131,6 +131,33 @@ namespace saivs
         sai_status_t remove_l2_vxlan_tunnel(
             _In_ sai_object_id_t tunnel_oid);
 
+        /**
+         * @brief Look up VPP sw_if_index for an L2 VxLAN tunnel by SAI tunnel OID.
+         * @return true if found, sw_if_index populated; false otherwise.
+         */
+        bool getL2TunnelSwIfIndex(sai_object_id_t tunnelOid, uint32_t &sw_if_index) const
+        {
+            auto it = m_l2_tunnel_map.find(tunnelOid);
+            if (it == m_l2_tunnel_map.end())
+                return false;
+            sw_if_index = it->second.sw_if_index;
+            return true;
+        }
+
+        /**
+         * @brief Look up VPP sw_if_index and VLAN ID for an L2 VxLAN tunnel.
+         * @return true if found; false otherwise.
+         */
+        bool getL2TunnelInfo(sai_object_id_t tunnelOid, uint32_t &sw_if_index, uint16_t &vlan_id) const
+        {
+            auto it = m_l2_tunnel_map.find(tunnelOid);
+            if (it == m_l2_tunnel_map.end())
+                return false;
+            sw_if_index = it->second.sw_if_index;
+            vlan_id = it->second.vlan_id;
+            return true;
+        }
+
     private:
         SwitchVpp* m_switch_db;
         std::array<uint8_t, 6> m_router_mac;
