@@ -591,20 +591,16 @@ TunnelManager::create_l2_vxlan_tunnel(
         SWSS_LOG_NOTICE("Added tunnel sw_if %u to BD %u with SHG=%u",
             tunnel_data.sw_if_index, vlan_id, tunnel_shg);
 
-        // Disable L2_LEARN on the tunnel interface only (not the whole BD).
-        // BD-level learning stays ON so local ports learn server MACs dynamically.
-        // Per-interface disable prevents mac-move violations when failover traffic
-        // arrives from the tunnel with source MACs known on local ports.
-        // VPP_BD_FLAG_LEARN = 1 — same bit value for per-interface l2_flags.
-        vpp_status = set_l2_interface_flags(tunnel_data.sw_if_index, VPP_BD_FLAG_LEARN, false);
-        if (vpp_status != 0) {
-            SWSS_LOG_WARN("Failed to disable learning on tunnel sw_if %u: %d",
-                tunnel_data.sw_if_index, vpp_status);
-            // Non-fatal — rerouted traffic may hit mac-move drops
-        } else {
-            SWSS_LOG_NOTICE("Disabled learning on tunnel sw_if %u (EVPN MH)",
-                tunnel_data.sw_if_index);
-        }
+        // NOTE: Do NOT call set_l2_interface_flags() to disable learning on the
+        // tunnel port. VPP's l2_flags API corrupts the per-interface l2-output
+        // feature config, causing SIGSEGV in l2output_node_fn_icl when the first
+        // BUM packet floods through the tunnel. (VPP v2510 bug.)
+        //
+        // Tunnel learning is harmless in EVPN MH:
+        // - Remote MACs learned on tunnel are correct (reachable via peer VTEP)
+        // - Local MACs always win on local ports (more frequent traffic)
+        // - SHG=1 prevents tunnel→tunnel BUM loops
+        // - Our event handler already skips tunnel-learned MACs for SAI FDB events
     }
 
     m_l2_tunnel_map[tunnel_oid] = tunnel_data;
