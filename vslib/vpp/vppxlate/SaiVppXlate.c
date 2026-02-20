@@ -2972,9 +2972,13 @@ int vpp_bridge_domain_add_del(uint32_t bridge_id, bool is_add)
 }
 int set_sw_interface_l2_bridge_by_index(uint32_t sw_if_index, uint32_t bridge_id, bool l2_mode, uint32_t port_type)
 {
+    return set_sw_interface_l2_bridge_by_index_with_shg(sw_if_index, bridge_id, l2_mode, port_type, 0);
+}
+
+int set_sw_interface_l2_bridge_by_index_with_shg(uint32_t sw_if_index, uint32_t bridge_id, bool l2_mode, uint32_t port_type, uint32_t shg)
+{
     vat_main_t *vam = &vat_main;
     vl_api_sw_interface_set_l2_bridge_t *mp;
-    u32 shg = 0;
     int ret;
 
     VPP_LOCK();
@@ -3007,6 +3011,11 @@ int set_sw_interface_l2_bridge_by_index(uint32_t sw_if_index, uint32_t bridge_id
 
 int set_sw_interface_l2_bridge(const char *hwif_name, uint32_t bridge_id, bool l2_mode, uint32_t port_type)
 {
+    return set_sw_interface_l2_bridge_with_shg(hwif_name, bridge_id, l2_mode, port_type, 0);
+}
+
+int set_sw_interface_l2_bridge_with_shg(const char *hwif_name, uint32_t bridge_id, bool l2_mode, uint32_t port_type, uint32_t shg)
+{
     vat_main_t *vam = &vat_main;
 
     if (hwif_name) {
@@ -3014,7 +3023,7 @@ int set_sw_interface_l2_bridge(const char *hwif_name, uint32_t bridge_id, bool l
 
         idx = get_swif_idx(vam, hwif_name);
         if (idx != (u32) -1) {
-            return set_sw_interface_l2_bridge_by_index(idx, bridge_id, l2_mode, port_type);
+            return set_sw_interface_l2_bridge_by_index_with_shg(idx, bridge_id, l2_mode, port_type, shg);
         } else {
             SAIVPP_ERROR("Unable to get sw_index for %s\n", hwif_name);
             return -EINVAL;
