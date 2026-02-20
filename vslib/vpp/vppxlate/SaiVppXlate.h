@@ -321,6 +321,7 @@ typedef enum {
     extern int interface_get_state(const char *hwif_name, bool *link_is_up);
     extern int vpp_sync_for_events();
     extern int vpp_bridge_domain_add_del(uint32_t bridge_id, bool is_add);
+    extern int set_l2_interface_flags(uint32_t sw_if_index, uint32_t feature_bitmap, bool is_set);
     extern int set_sw_interface_l2_bridge(const char *hwif_name, uint32_t bridge_id, bool l2_enable, uint32_t port_type);
     extern int set_sw_interface_l2_bridge_with_shg(const char *hwif_name, uint32_t bridge_id, bool l2_enable, uint32_t port_type, uint32_t shg);
     extern int set_sw_interface_l2_bridge_by_index(uint32_t sw_if_index, uint32_t bridge_id, bool l2_enable, uint32_t port_type);

@@ -570,18 +570,19 @@ TunnelManager::create_l2_vxlan_tunnel(
         SWSS_LOG_NOTICE("Added tunnel sw_if %u to BD %u with SHG=%u",
             tunnel_data.sw_if_index, vlan_id, tunnel_shg);
 
-        // Disable MAC learning on the BD to prevent mac-move violations.
-        // When traffic is rerouted through the tunnel during failover, the remote
-        // T1 receives frames whose source MACs have static L2FIB entries on local
-        // ports. VPP's l2-learn node treats this as a mac-move violation and drops
-        // the frame. Disabling learning avoids this — we use static FDB entries
-        // managed by fdborch/evpnmhorch, not dynamic learning.
-        vpp_status = set_bridge_domain_flags(vlan_id, VPP_BD_FLAG_LEARN, false);
+        // Disable L2_LEARN on the tunnel interface only (not the whole BD).
+        // BD-level learning stays ON so local ports learn server MACs dynamically.
+        // Per-interface disable prevents mac-move violations when failover traffic
+        // arrives from the tunnel with source MACs known on local ports.
+        // VPP_BD_FLAG_LEARN = 1 — same bit value for per-interface l2_flags.
+        vpp_status = set_l2_interface_flags(tunnel_data.sw_if_index, VPP_BD_FLAG_LEARN, false);
         if (vpp_status != 0) {
-            SWSS_LOG_WARN("Failed to disable learning on BD %u: %d", vlan_id, vpp_status);
-            // Non-fatal — learning was previously on, reroute may hit mac-move drops
+            SWSS_LOG_WARN("Failed to disable learning on tunnel sw_if %u: %d",
+                tunnel_data.sw_if_index, vpp_status);
+            // Non-fatal — rerouted traffic may hit mac-move drops
         } else {
-            SWSS_LOG_NOTICE("Disabled learning on BD %u (EVPN MH tunnel active)", vlan_id);
+            SWSS_LOG_NOTICE("Disabled learning on tunnel sw_if %u (EVPN MH)",
+                tunnel_data.sw_if_index);
         }
     }
 
@@ -626,17 +627,6 @@ TunnelManager::remove_l2_vxlan_tunnel(
     } else {
         SWSS_LOG_NOTICE("Removed tunnel sw_if %u from BD %u",
             tunnel_data.sw_if_index, tunnel_data.vlan_id);
-    }
-
-    // Re-enable MAC learning on the BD now that tunnel is removed.
-    // Learning was disabled during tunnel creation to prevent mac-move violations.
-    vpp_status = set_bridge_domain_flags(tunnel_data.vlan_id, VPP_BD_FLAG_LEARN, true);
-    if (vpp_status != 0) {
-        SWSS_LOG_WARN("Failed to re-enable learning on BD %u: %d",
-            tunnel_data.vlan_id, vpp_status);
-    } else {
-        SWSS_LOG_NOTICE("Re-enabled learning on BD %u (EVPN MH tunnel removed)",
-            tunnel_data.vlan_id);
     }
     
     // Delete the VPP VXLAN tunnel interface
