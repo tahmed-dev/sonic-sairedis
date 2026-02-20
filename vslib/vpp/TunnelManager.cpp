@@ -549,6 +549,14 @@ TunnelManager::create_l2_vxlan_tunnel(
         return SAI_STATUS_FAILURE;
     }
 
+    // Guard against sw_if_index=0 — VPP's local0 loopback.  If the VxLAN
+    // encap creation returned 0, it silently failed (e.g. BGP hasn't resolved
+    // the remote VTEP yet).  Adding local0 to a BD corrupts forwarding.
+    if (tunnel_data.sw_if_index == 0) {
+        SWSS_LOG_ERROR("VxLAN tunnel creation returned sw_if_index=0 (local0), aborting BD add");
+        return SAI_STATUS_FAILURE;
+    }
+
     // Add tunnel interface to bridge domain (VLAN) with SHG=1
     // SHG (Split Horizon Group) isolation: local ports use SHG=0, tunnel uses SHG=1.
     // This prevents BUM traffic from flooding local→tunnel during steady state.
