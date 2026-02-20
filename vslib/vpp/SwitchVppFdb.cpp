@@ -446,12 +446,21 @@ sai_status_t SwitchVpp::vpp_create_bvi_interface(
     //Set interface state up
     interface_set_state(hw_ifname, true);
 
-    //Set the bvi as access or untagged port of the bridge
-    vpp_l2_vtr_op_t vtr_op = L2_VTR_PUSH_1;
-    vpp_vlan_type_t push_dot1q = VLAN_DOT1Q;
-    uint32_t tag1 = (uint32_t)vlan_id;
-    uint32_t tag2 = ~0;
-    set_l2_interface_vlan_tag_rewrite(hw_ifname, tag1, tag2, push_dot1q, vtr_op);
+    /*
+     * Disable VTR on the BVI.  Physical untagged ports need PUSH_1 so VPP's
+     * BD can distinguish VLAN membership internally, but the BVI is a routed
+     * L3 interface — its LCP tap should receive untagged IP frames.  With
+     * VTR disabled, punted packets arrive on "bvivlan<N>" without a VLAN tag,
+     * so no kernel sub-interface (bvivlan<N>.<N>) is needed.  Creating such a
+     * sub-interface caused VPP's LCP plugin to attempt a VPP sub-interface on
+     * the BVI, triggering a SIGABRT.
+     */
+    {
+        vpp_l2_vtr_op_t vtr_op = L2_VTR_DISABLED;
+        vpp_vlan_type_t push_dot1q = VLAN_DOT1Q;
+        uint32_t tag1 = 0, tag2 = ~0;
+        set_l2_interface_vlan_tag_rewrite(hw_ifname, tag1, tag2, push_dot1q, vtr_op);
+    }
 
     //Set the arp termination for bridge
     uint32_t bd_id = (uint32_t) vlan_id;
@@ -465,9 +474,6 @@ sai_status_t SwitchVpp::vpp_create_bvi_interface(
      * bridge/VLAN subsystem already creates that interface.  Use "bvivlan<N>"
      * instead.  VPP's DVR punt redirect is set up automatically by the LCP
      * plugin.
-     *
-     * The DVR reinject preserves the VLAN tag from the BD tag-rewrite, so we
-     * also create a kernel VLAN sub-interface (bvivlan<N>.<N>) to strip it.
      */
     {
         char bvi_ifname[32], host_ifname[32];
@@ -477,19 +483,12 @@ sai_status_t SwitchVpp::vpp_create_bvi_interface(
         SWSS_LOG_NOTICE("Creating LCP pair for BVI: %s -> %s", bvi_ifname, host_ifname);
         configure_lcp_interface(bvi_ifname, host_ifname, true);
 
-        /* Create kernel VLAN sub-interface and bring both up */
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd),
-                 "ip link add link %s name %s.%u type vlan id %u 2>/dev/null; "
-                 "ip link set %s up; "
-                 "ip link set %s.%u up",
-                 host_ifname, host_ifname, vlan_id, vlan_id,
-                 host_ifname,
-                 host_ifname, vlan_id);
+        /* Bring the LCP tap interface up */
+        char cmd[128];
+        snprintf(cmd, sizeof(cmd), "ip link set %s up", host_ifname);
         if (system(cmd) != 0) {
-            SWSS_LOG_WARN("Failed to create kernel VLAN sub-interface %s.%u", host_ifname, vlan_id);
+            SWSS_LOG_WARN("Failed to bring up %s", host_ifname);
         }
-        SWSS_LOG_NOTICE("Created kernel VLAN sub-interface %s.%u", host_ifname, vlan_id);
     }
 
     return SAI_STATUS_SUCCESS;
