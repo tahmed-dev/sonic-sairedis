@@ -260,6 +260,19 @@ TunnelManager::create_vpp_vxlan_encap(
     SWSS_LOG_INFO("create vxlan tunnel src %s dst %s vni %d: sw_if_index,%d, status %d",
             src_ip_str, dst_ip_str,
             req.vni, sw_if_index, vpp_status);
+
+    // If creation returned sw_if_index 0, the tunnel may already exist from a
+    // previous boot (docker commit persists VPP state).  Delete and re-create
+    // to get the correct sw_if_index.
+    if (vpp_status == 0 && sw_if_index == 0) {
+        SWSS_LOG_NOTICE("VxLAN tunnel add returned sw_if_index=0, deleting stale tunnel and retrying");
+        u_int32_t dummy_idx = 0;
+        vpp_vxlan_tunnel_add_del(&req, 0, &dummy_idx);  // delete
+        vpp_status = vpp_vxlan_tunnel_add_del(&req, 1, &sw_if_index);  // re-create
+        SWSS_LOG_NOTICE("VxLAN tunnel re-create: sw_if_index=%d, status=%d",
+                sw_if_index, vpp_status);
+    }
+
     if (vpp_status != 0) {
         SWSS_LOG_ERROR("Failed to create vxlan tunnel");
         return SAI_STATUS_FAILURE;
