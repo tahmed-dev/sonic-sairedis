@@ -187,12 +187,21 @@ sai_status_t SwitchVpp::vpp_create_vlan_member(
         //Create bridge and set the l2 port
         set_sw_interface_l2_bridge(hw_ifname,bridge_id, true, VPP_API_PORT_TYPE_NORMAL);
 
-        //Set the vlan member to bridge and tags rewrite
-        vpp_l2_vtr_op_t vtr_op = L2_VTR_PUSH_1;
-        vpp_vlan_type_t push_dot1q = VLAN_DOT1Q;
-        uint32_t tag1 = (uint32_t)vlan_id;
-        uint32_t tag2 = ~0;
-        set_l2_interface_vlan_tag_rewrite(hw_ifname, tag1, tag2, push_dot1q, vtr_op);
+        /*
+         * Do NOT set VTR (VLAN Tag Rewrite) for untagged access ports.
+         *
+         * The previous code set L2_VTR_PUSH_1 here, which pushes a dot1q
+         * VLAN tag on BOTH L2 input and output directions in VPP.  This
+         * causes frames inside the bridge domain to carry an unexpected
+         * VLAN tag.  When the BD forwards such a frame to the BVI and the
+         * LCP (Linux Control Plane) tap delivers it to the kernel, the
+         * kernel's VLAN interface (e.g. Vlan10) sees a double-tagged frame
+         * and drops it silently.
+         *
+         * For untagged (access) ports the wire carries untagged frames and
+         * the port is already classified into the correct BD by its
+         * membership alone — no tag manipulation is needed.
+         */
     }
     else {
         SWSS_LOG_ERROR("Tagging Mode %d not implemented", tagging_mode);
@@ -343,14 +352,6 @@ sai_status_t SwitchVpp::vpp_remove_vlan_member(
     char host_subifname[32];
     if (tagging_mode == SAI_VLAN_TAGGING_MODE_UNTAGGED)
     {
-
-        //First disable tag-rewrite.
-        vpp_l2_vtr_op_t vtr_op =L2_VTR_DISABLED;
-        vpp_vlan_type_t push_dot1q = VLAN_DOT1Q;
-        uint32_t tag1 = (uint32_t)vlan_id;
-        uint32_t tag2 = ~0;
-        set_l2_interface_vlan_tag_rewrite(hw_ifname, tag1, tag2, push_dot1q, vtr_op);
-
         //Remove interface from bridge, interface type should be changed to others types like l3.
         set_sw_interface_l2_bridge(hw_ifname, bridge_id, false, VPP_API_PORT_TYPE_NORMAL);
     }
