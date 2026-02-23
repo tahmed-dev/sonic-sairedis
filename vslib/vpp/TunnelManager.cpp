@@ -10,6 +10,8 @@
 
 #include "vppxlate/SaiVppXlate.h"
 
+#include <arpa/inet.h>
+
 using namespace saivs;
 
 #define CHECK_STATUS_W_MSG(status, msg, ...) {                                  \
@@ -53,6 +55,72 @@ TunnelManager::set_vxlan_port(const sai_attribute_t* attr)
 
     m_vxlan_port = attr->value.u16;
 }
+
+bool
+TunnelManager::get_overlay_bvi_mac(_Out_ uint8_t mac[6]) const
+{
+    SWSS_LOG_ENTER();
+
+    /*
+     * Scan all ROUTER_INTERFACE objects for a VLAN-type RIF that has
+     * SAI_ROUTER_INTERFACE_ATTR_SRC_MAC_ADDRESS set (the anycast gateway MAC).
+     * This MAC is used as the inner destination Ethernet address in L3 VxLAN
+     * encapsulation so that on decap the remote BVI's l2_to_bvi_dmac_check()
+     * matches and delivers the frame to L3 routing.
+     *
+     * In EVPN MH, all T1 switches share the same anycast MAC on their overlay
+     * BVI, so any VLAN RIF's SRC_MAC will do.
+     */
+    auto obj_it = m_switch_db->m_objectHash.find(SAI_OBJECT_TYPE_ROUTER_INTERFACE);
+    if (obj_it != m_switch_db->m_objectHash.end())
+    {
+        for (auto& pair : obj_it->second)
+        {
+            auto& attrs = pair.second;
+
+            /* Check if this is a VLAN-type RIF */
+            auto type_it = attrs.find("SAI_ROUTER_INTERFACE_ATTR_TYPE");
+            if (type_it == attrs.end())
+                continue;
+
+            const sai_attribute_t* type_attr = type_it->second->getAttr();
+            if (type_attr->value.s32 != SAI_ROUTER_INTERFACE_TYPE_VLAN)
+                continue;
+
+            /* Look for SRC_MAC_ADDRESS */
+            auto mac_it = attrs.find("SAI_ROUTER_INTERFACE_ATTR_SRC_MAC_ADDRESS");
+            if (mac_it == attrs.end())
+                continue;
+
+            const sai_attribute_t* mac_attr = mac_it->second->getAttr();
+
+            /* Verify non-zero */
+            bool all_zero = true;
+            for (int i = 0; i < 6; i++)
+            {
+                if (mac_attr->value.mac[i] != 0) { all_zero = false; break; }
+            }
+            if (all_zero)
+                continue;
+
+            memcpy(mac, mac_attr->value.mac, 6);
+            SWSS_LOG_NOTICE("get_overlay_bvi_mac: found anycast MAC "
+                             "%02x:%02x:%02x:%02x:%02x:%02x from VLAN RIF %s",
+                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                             pair.first.c_str());
+            return true;
+        }
+    }
+
+    /* Fallback to default router MAC */
+    auto& rm = get_router_mac();
+    memcpy(mac, rm.data(), 6);
+    SWSS_LOG_NOTICE("get_overlay_bvi_mac: no anycast MAC found, using router MAC "
+                     "%02x:%02x:%02x:%02x:%02x:%02x",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return false;
+}
+
 /**
  * VxLAN tunnel is created in response to the creation of a tunnel encap nexthop entry. This assumes VxLAN tunnel is bidirectional and symmetric.
  * The local VTEP sends packet through the tunnel to the remote VTEP. The remote VTEP sends packet back to the local VTEP through the same tunnel with the same VNI.
@@ -188,7 +256,13 @@ TunnelManager::tunnel_encap_nexthop_action(
                     return SAI_STATUS_FAILURE;
                 }
 
-                if (create_vpp_vxlan_decap(tunnel_data) != SAI_STATUS_SUCCESS) {
+                /* Skip decap if this tunnel was reused from boot-time L3 setup —
+                 * vpp_l3_vxlan_tunnel_add already bound it to the VRF. */
+                auto existing = find_existing_vxlan_tunnel(req);
+                if (existing.first && existing.second == tunnel_data.sw_if_index) {
+                    SWSS_LOG_NOTICE("Reused L3 tunnel sw_if_index %d, skipping decap setup",
+                            tunnel_data.sw_if_index);
+                } else if (create_vpp_vxlan_decap(tunnel_data) != SAI_STATUS_SUCCESS) {
                     SWSS_LOG_ERROR("Failed to create vxlan decap for %s",
                         tunnel_nh_obj->get_id().c_str());
                     remove_vpp_vxlan_encap(req, tunnel_data);
@@ -240,6 +314,63 @@ TunnelManager::remove_tunnel_encap_nexthop(
     return tunnel_encap_nexthop_action(tunnel_nh_obj.get(), Action::DELETE);
 }
 
+std::pair<bool, uint32_t>
+TunnelManager::find_existing_vxlan_tunnel(
+                    _In_ const vpp_vxlan_tunnel_t& req)
+{
+    SWSS_LOG_ENTER();
+
+    /* Convert req IPs to sai_ip_address_t for comparison with L3TunnelVPPData */
+    sai_ip_address_t req_src, req_dst;
+    memset(&req_src, 0, sizeof(req_src));
+    memset(&req_dst, 0, sizeof(req_dst));
+
+    if (req.src_address.sa_family == AF_INET)
+    {
+        req_src.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
+        memcpy(&req_src.addr.ip4, &req.src_address.addr.ip4.sin_addr, 4);
+        req_dst.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
+        memcpy(&req_dst.addr.ip4, &req.dst_address.addr.ip4.sin_addr, 4);
+    }
+    else
+    {
+        req_src.addr_family = SAI_IP_ADDR_FAMILY_IPV6;
+        memcpy(&req_src.addr.ip6, &req.src_address.addr.ip6.sin6_addr, 16);
+        req_dst.addr_family = SAI_IP_ADDR_FAMILY_IPV6;
+        memcpy(&req_dst.addr.ip6, &req.dst_address.addr.ip6.sin6_addr, 16);
+    }
+
+    for (const auto& pair : m_l3_tunnel_map)
+    {
+        const auto& data = pair.second;
+        if (data.vni != req.vni)
+            continue;
+        if (data.src_ip.addr_family != req_src.addr_family)
+            continue;
+
+        bool src_match, dst_match;
+        if (req_src.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
+        {
+            src_match = (memcmp(&req_src.addr.ip4, &data.src_ip.addr.ip4, 4) == 0);
+            dst_match = (memcmp(&req_dst.addr.ip4, &data.dst_ip.addr.ip4, 4) == 0);
+        }
+        else
+        {
+            src_match = (memcmp(&req_src.addr.ip6, &data.src_ip.addr.ip6, 16) == 0);
+            dst_match = (memcmp(&req_dst.addr.ip6, &data.dst_ip.addr.ip6, 16) == 0);
+        }
+
+        if (src_match && dst_match)
+        {
+            SWSS_LOG_NOTICE("find_existing_vxlan_tunnel: found L3 tunnel vni=%d sw_if_index=%d",
+                    data.vni, data.sw_if_index);
+            return {true, data.sw_if_index};
+        }
+    }
+
+    return {false, 0};
+}
+
 sai_status_t
 TunnelManager::create_vpp_vxlan_encap(
                     _In_  vpp_vxlan_tunnel_t& req,
@@ -251,8 +382,19 @@ TunnelManager::create_vpp_vxlan_encap(
     u_int32_t                   sw_if_index;
     char                        src_ip_str[INET6_ADDRSTRLEN];
     char                        dst_ip_str[INET6_ADDRSTRLEN];
-    auto                        router_mac = get_router_mac();
-    auto                        bvi_mac = router_mac.data();
+
+    /*
+     * Use the overlay BVI MAC (anycast gateway MAC) for the inner Ethernet
+     * dst MAC in VxLAN encapsulation.  On decap, the remote VPP's
+     * l2_to_bvi_dmac_check() must match this MAC against the BVI's hw_address
+     * to deliver the frame to L3 routing.
+     *
+     * Previously this used m_router_mac (default 00:00:00:00:00:01), which
+     * never matched the BVI's anycast MAC, causing "BVI L3 mac mismatch"
+     * drops in l2-flood for all L3 VxLAN failover traffic.
+     */
+    uint8_t                     inner_dst_mac[6];
+    get_overlay_bvi_mac(inner_dst_mac);
 
     vpp_status = vpp_vxlan_tunnel_add_del(&req, 1, &sw_if_index);
     vpp_ip_addr_t_to_string(&req.src_address, src_ip_str, INET6_ADDRSTRLEN);
@@ -260,18 +402,44 @@ TunnelManager::create_vpp_vxlan_encap(
     SWSS_LOG_INFO("create vxlan tunnel src %s dst %s vni %d: sw_if_index,%d, status %d",
             src_ip_str, dst_ip_str,
             req.vni, sw_if_index, vpp_status);
+
+    // If creation returned sw_if_index 0, the tunnel may already exist from a
+    // previous boot (docker commit persists VPP state).  Delete and re-create
+    // to get the correct sw_if_index.
+    if (vpp_status == 0 && sw_if_index == 0) {
+        SWSS_LOG_NOTICE("VxLAN tunnel add returned sw_if_index=0, deleting stale tunnel and retrying");
+        u_int32_t dummy_idx = 0;
+        vpp_vxlan_tunnel_add_del(&req, 0, &dummy_idx);  // delete
+        vpp_status = vpp_vxlan_tunnel_add_del(&req, 1, &sw_if_index);  // re-create
+        SWSS_LOG_NOTICE("VxLAN tunnel re-create: sw_if_index=%d, status=%d",
+                sw_if_index, vpp_status);
+    }
+
     if (vpp_status != 0) {
-        SWSS_LOG_ERROR("Failed to create vxlan tunnel");
-        return SAI_STATUS_FAILURE;
+        // Tunnel may already exist (e.g., L3 VxLAN tunnel created at boot by
+        // vpp_l3_vxlan_tunnel_add).  Look up existing tunnel by src/dst/VNI
+        // and reuse its sw_if_index instead of failing.
+        auto existing = find_existing_vxlan_tunnel(req);
+        if (existing.first) {
+            sw_if_index = existing.second;
+            SWSS_LOG_NOTICE("VxLAN tunnel already exists (src %s dst %s vni %d), reusing sw_if_index %d",
+                    src_ip_str, dst_ip_str, req.vni, sw_if_index);
+        } else {
+            SWSS_LOG_ERROR("Failed to create vxlan tunnel");
+            return SAI_STATUS_FAILURE;
+        }
     }
     tunnel_data.sw_if_index = sw_if_index;
     /* the neighbour is to build inner ether. use no_fib_entry to avoid creating the nh in the fib, which will mess up underlay forwarding*/
     if (req.dst_address.sa_family == AF_INET6) {
-        ip6_nbr_add_del(NULL, sw_if_index, &req.dst_address.addr.ip6, false, true/*no_fib_entry*/, bvi_mac, 1);
+        ip6_nbr_add_del(NULL, sw_if_index, &req.dst_address.addr.ip6, false, true/*no_fib_entry*/, inner_dst_mac, 1);
     } else {
-        ip4_nbr_add_del(NULL, sw_if_index, &req.dst_address.addr.ip4, false, true/*no_fib_entry*/, bvi_mac, 1);
+        ip4_nbr_add_del(NULL, sw_if_index, &req.dst_address.addr.ip4, false, true/*no_fib_entry*/, inner_dst_mac, 1);
     }
-    SWSS_LOG_INFO("successfully created encap for vxlan tunnel %d", sw_if_index);
+    SWSS_LOG_NOTICE("created encap for vxlan tunnel %d, inner dst MAC %02x:%02x:%02x:%02x:%02x:%02x",
+                     sw_if_index,
+                     inner_dst_mac[0], inner_dst_mac[1], inner_dst_mac[2],
+                     inner_dst_mac[3], inner_dst_mac[4], inner_dst_mac[5]);
     return SAI_STATUS_SUCCESS;
 }
 
@@ -286,13 +454,25 @@ TunnelManager::remove_vpp_vxlan_encap(
     u_int32_t                   sw_if_index = tunnel_data.sw_if_index;
     char                        src_ip_str[INET6_ADDRSTRLEN];
     char                        dst_ip_str[INET6_ADDRSTRLEN];
-    auto                        router_mac = get_router_mac();
-    auto                        bvi_mac = router_mac.data();
+
+    /* Use the same overlay BVI MAC that was used at encap creation time */
+    uint8_t                     inner_dst_mac[6];
+    get_overlay_bvi_mac(inner_dst_mac);
 
     if (req.dst_address.sa_family == AF_INET6) {
-        ip6_nbr_add_del(NULL, tunnel_data.sw_if_index, &req.dst_address.addr.ip6, false, true/*no_fib_entry*/, bvi_mac, 0);
+        ip6_nbr_add_del(NULL, tunnel_data.sw_if_index, &req.dst_address.addr.ip6, false, true/*no_fib_entry*/, inner_dst_mac, 0);
     } else {
-        ip4_nbr_add_del(NULL, tunnel_data.sw_if_index, &req.dst_address.addr.ip4, false, true/*no_fib_entry*/, bvi_mac, 0);
+        ip4_nbr_add_del(NULL, tunnel_data.sw_if_index, &req.dst_address.addr.ip4, false, true/*no_fib_entry*/, inner_dst_mac, 0);
+    }
+
+    /* Don't delete the VxLAN tunnel if it's a shared L3 tunnel created at
+     * boot — it's managed by vpp_l3_vxlan_tunnel_add/remove lifecycle,
+     * not by per-nexthop lifecycle. */
+    auto existing = find_existing_vxlan_tunnel(req);
+    if (existing.first && existing.second == tunnel_data.sw_if_index) {
+        SWSS_LOG_NOTICE("Skipping VxLAN tunnel delete — shared L3 tunnel sw_if_index %d",
+                tunnel_data.sw_if_index);
+        return SAI_STATUS_SUCCESS;
     }
 
     vpp_status = vpp_vxlan_tunnel_add_del(&req, 0, &sw_if_index);
@@ -410,5 +590,396 @@ TunnelManager::remove_vpp_vxlan_decap(
     vpp_bridge_domain_add_del(tunnel_data.bd_id, false);
     SWSS_LOG_INFO("successfully deleted decap of vxlan tunnel %d with BD %d",
                         tunnel_data.sw_if_index, tunnel_data.bd_id);
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t
+TunnelManager::create_l2_vxlan_tunnel(
+    _In_ sai_object_id_t tunnel_oid,
+    _Out_ uint32_t& sw_if_index)
+{
+    SWSS_LOG_ENTER();
+
+    sw_if_index = ~0;
+
+    // Check if already created
+    auto it = m_l2_tunnel_map.find(tunnel_oid);
+    if (it != m_l2_tunnel_map.end()) {
+        sw_if_index = it->second.sw_if_index;
+        SWSS_LOG_NOTICE("L2 VXLAN tunnel already exists: tunnel=%s sw_if=%u",
+            sai_serialize_object_id(tunnel_oid).c_str(), sw_if_index);
+        return SAI_STATUS_SUCCESS;
+    }
+
+    // Get tunnel object
+    auto tunnel_obj = m_switch_db->get_sai_object(SAI_OBJECT_TYPE_TUNNEL,
+        sai_serialize_object_id(tunnel_oid));
+    if (!tunnel_obj) {
+        SWSS_LOG_ERROR("Tunnel %s not found", sai_serialize_object_id(tunnel_oid).c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    // Check tunnel type
+    sai_attribute_t attr;
+    attr.id = SAI_TUNNEL_ATTR_TYPE;
+    if (tunnel_obj->get_attr(attr) != SAI_STATUS_SUCCESS) {
+        SWSS_LOG_ERROR("Missing SAI_TUNNEL_ATTR_TYPE");
+        return SAI_STATUS_FAILURE;
+    }
+    if (attr.value.s32 != SAI_TUNNEL_TYPE_VXLAN) {
+        SWSS_LOG_NOTICE("Not a VXLAN tunnel (type=%d), skipping", attr.value.s32);
+        return SAI_STATUS_SUCCESS;
+    }
+
+    // Get src IP
+    attr.id = SAI_TUNNEL_ATTR_ENCAP_SRC_IP;
+    if (tunnel_obj->get_attr(attr) != SAI_STATUS_SUCCESS) {
+        SWSS_LOG_ERROR("Missing ENCAP_SRC_IP");
+        return SAI_STATUS_FAILURE;
+    }
+    sai_ip_address_t src_ip = attr.value.ipaddr;
+
+    // Get dst IP - if missing, this is local VTEP, not P2P tunnel
+    attr.id = SAI_TUNNEL_ATTR_ENCAP_DST_IP;
+    if (tunnel_obj->get_attr(attr) != SAI_STATUS_SUCCESS) {
+        SWSS_LOG_NOTICE("No ENCAP_DST_IP - local VTEP tunnel, skipping VPP creation");
+        return SAI_STATUS_SUCCESS;
+    }
+    sai_ip_address_t dst_ip = attr.value.ipaddr;
+
+    // Find VNI and VLAN from decap mappers
+    uint32_t vni = 0;
+    uint16_t vlan_id = 0;
+
+    auto decap_mappers = tunnel_obj->get_linked_objects(
+        SAI_OBJECT_TYPE_TUNNEL_MAP, SAI_TUNNEL_ATTR_DECAP_MAPPERS);
+    
+    SWSS_LOG_NOTICE("Found %zu decap mappers", decap_mappers.size());
+
+    for (auto mapper : decap_mappers) {
+        attr.id = SAI_TUNNEL_MAP_ATTR_TYPE;
+        if (mapper->get_attr(attr) != SAI_STATUS_SUCCESS) continue;
+        SWSS_LOG_NOTICE("Mapper type: %d", attr.value.s32);
+        if (attr.value.s32 != SAI_TUNNEL_MAP_TYPE_VNI_TO_VLAN_ID) continue;
+
+        auto entries = mapper->get_child_objs(SAI_OBJECT_TYPE_TUNNEL_MAP_ENTRY);
+        if (!entries) {
+            SWSS_LOG_NOTICE("No entries in mapper");
+            continue;
+        }
+
+        SWSS_LOG_NOTICE("Mapper has %zu entries", entries->size());
+
+        for (auto& entry_pair : *entries) {
+            auto entry = entry_pair.second;
+
+            // Get VNI
+            attr.id = SAI_TUNNEL_MAP_ENTRY_ATTR_VNI_ID_KEY;
+            if (entry->get_attr(attr) == SAI_STATUS_SUCCESS) {
+                vni = attr.value.u32;
+                SWSS_LOG_NOTICE("Found VNI=%u", vni);
+            }
+
+            // Get VLAN ID
+            attr.id = SAI_TUNNEL_MAP_ENTRY_ATTR_VLAN_ID_VALUE;
+            if (entry->get_attr(attr) == SAI_STATUS_SUCCESS) {
+                vlan_id = attr.value.u16;
+                SWSS_LOG_NOTICE("Found VLAN=%u", vlan_id);
+            }
+
+            if (vni != 0 && vlan_id != 0) break;
+        }
+        if (vni != 0 && vlan_id != 0) break;
+    }
+
+    if (vni == 0) {
+        SWSS_LOG_ERROR("No VNI found in tunnel mappers for tunnel %s",
+            sai_serialize_object_id(tunnel_oid).c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    if (vlan_id == 0) {
+        SWSS_LOG_ERROR("No VLAN found in tunnel mappers for tunnel %s",
+            sai_serialize_object_id(tunnel_oid).c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    /*
+     * L2 VxLAN data plane tunnel is NOT created in VPP.
+     *
+     * In the L3 failover architecture, the overlay is pure L3: PROTECTION
+     * NHGs route traffic through L3 VxLAN tunnels during failover.  The
+     * L2 VNI (e.g. 2000) exists only for EVPN control plane — FRR uses
+     * the kernel VxLAN device (created by vxlanmgr) to discover the VNI
+     * and advertise Type-2 MAC/IP routes via BGP.  No L2 bridging or BUM
+     * flooding across VTEPs is needed.
+     *
+     * We still place the L3 VxLAN tunnel into the overlay BD so that
+     * decapped failover traffic reaches the BVI for L3 routing.
+     */
+    SWSS_LOG_NOTICE("Skipping L2 VxLAN data plane tunnel (VNI=%u VLAN=%u) — "
+                    "L3 failover mode, no L2 bridging needed",
+                    vni, vlan_id);
+
+    sw_if_index = 0;  // No VPP interface created
+
+    /*
+     * Place any L3 VxLAN tunnel with the same src/dst VTEP pair into the
+     * overlay BD (with SHG=1).
+     *
+     * L3 tunnels are created VRF-bound for encap, but VPP's VxLAN decap
+     * defaults to l2-input.  Without explicit BD placement the L3 tunnel
+     * ends up in an auto-assigned BD (e.g. 4096) and decapped packets
+     * can't reach the overlay BVI — causing "BVI L3 mac mismatch" drops.
+     *
+     * SHG=1 prevents BUM flooding issues.  Learning is left enabled
+     * (VPP l2_flags API bug causes SIGSEGV).
+     */
+    if (vlan_id != 0)
+    {
+        for (auto& l3_pair : m_l3_tunnel_map)
+        {
+            auto& l3_data = l3_pair.second;
+
+            /* Match by src/dst VTEP IPs (L3 and L2 tunnels share the same
+             * VTEP pair but use different VNIs) */
+            bool src_match = false, dst_match = false;
+
+            if (src_ip.addr_family == l3_data.src_ip.addr_family)
+            {
+                if (src_ip.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
+                {
+                    src_match = (memcmp(&src_ip.addr.ip4,
+                                        &l3_data.src_ip.addr.ip4, 4) == 0);
+                    dst_match = (memcmp(&dst_ip.addr.ip4,
+                                        &l3_data.dst_ip.addr.ip4, 4) == 0);
+                }
+                else
+                {
+                    src_match = (memcmp(&src_ip.addr.ip6,
+                                        &l3_data.src_ip.addr.ip6, 16) == 0);
+                    dst_match = (memcmp(&dst_ip.addr.ip6,
+                                        &l3_data.dst_ip.addr.ip6, 16) == 0);
+                }
+            }
+
+            if (src_match && dst_match)
+            {
+                const uint32_t l3_shg = 1;
+                int l3_status = set_sw_interface_l2_bridge_by_index_with_shg(
+                    l3_data.sw_if_index, vlan_id, true,
+                    VPP_API_PORT_TYPE_NORMAL, l3_shg);
+
+                if (l3_status == 0)
+                {
+                    SWSS_LOG_NOTICE("Placed L3 tunnel sw_if %u (VNI=%u) "
+                                    "into BD %u with SHG=%u for decap path",
+                                    l3_data.sw_if_index, l3_data.vni,
+                                    vlan_id, l3_shg);
+                }
+                else
+                {
+                    SWSS_LOG_ERROR("Failed to place L3 tunnel sw_if %u "
+                                   "into BD %u (status=%d)",
+                                   l3_data.sw_if_index, vlan_id, l3_status);
+                }
+                /* Only one L3 tunnel per src/dst pair */
+                break;
+            }
+        }
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t
+TunnelManager::remove_l2_vxlan_tunnel(
+    _In_ sai_object_id_t tunnel_oid)
+{
+    SWSS_LOG_ENTER();
+
+    /*
+     * No VPP L2 VxLAN tunnel was created (L3 failover mode), so nothing
+     * to remove.  The L3 tunnel BD placement is cleaned up when the L3
+     * tunnel itself is removed.
+     */
+    SWSS_LOG_NOTICE("L2 VxLAN tunnel removal for %s — no-op (L3 failover mode)",
+        sai_serialize_object_id(tunnel_oid).c_str());
+
+    return SAI_STATUS_SUCCESS;
+}
+
+// ─── L3 VxLAN Tunnel (VRF-bound) ──────────────────────────────────────────────
+
+sai_status_t
+TunnelManager::create_l3_vxlan_tunnel(
+    _In_ sai_object_id_t tunnel_oid,
+    _In_ uint32_t vni,
+    _In_ uint32_t vrf_id,
+    _In_ const sai_ip_address_t &src,
+    _In_ const sai_ip_address_t &dst)
+{
+    SWSS_LOG_ENTER();
+
+    // Check if already created
+    auto it = m_l3_tunnel_map.find(tunnel_oid);
+    if (it != m_l3_tunnel_map.end()) {
+        SWSS_LOG_NOTICE("L3 VxLAN tunnel already exists: tunnel=%s sw_if=%u",
+            sai_serialize_object_id(tunnel_oid).c_str(), it->second.sw_if_index);
+        return SAI_STATUS_SUCCESS;
+    }
+
+    // Only IPv4 src/dst supported for now
+    if (src.addr_family != SAI_IP_ADDR_FAMILY_IPV4 ||
+        dst.addr_family != SAI_IP_ADDR_FAMILY_IPV4) {
+        SWSS_LOG_ERROR("L3 VxLAN tunnel: only IPv4 VTEP addresses supported");
+        return SAI_STATUS_NOT_IMPLEMENTED;
+    }
+
+    uint32_t sw_if_index = 0;
+    int ret = vpp_l3_vxlan_tunnel_add(
+        src.addr.ip4, dst.addr.ip4, vni, vrf_id, &sw_if_index);
+
+    if (ret != 0) {
+        /*
+         * Tunnel may already exist in VPP from a previous boot cycle
+         * (syncd restart doesn't destroy VPP tunnels).  Query VPP
+         * directly via vppctl to find the existing tunnel's sw_if_index.
+         *
+         * We can't use find_existing_vxlan_tunnel() here because
+         * m_l3_tunnel_map is empty after syncd restart — the tunnel
+         * exists in VPP but not in our in-memory map.
+         */
+        char src_str[INET_ADDRSTRLEN], dst_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &src.addr.ip4, src_str, sizeof(src_str));
+        inet_ntop(AF_INET, &dst.addr.ip4, dst_str, sizeof(dst_str));
+
+        /* Parse `vppctl show vxlan tunnel` output to find matching tunnel */
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd),
+                 "vppctl show vxlan tunnel 2>/dev/null | "
+                 "grep 'src %s dst %s.*vni %u' | "
+                 "head -1 | sed 's/.*sw-if-idx //' | awk '{print $1}'",
+                 src_str, dst_str, vni);
+        FILE *fp = popen(cmd, "r");
+        if (fp) {
+            char buf[32];
+            if (fgets(buf, sizeof(buf), fp)) {
+                sw_if_index = (uint32_t)atoi(buf);
+            }
+            pclose(fp);
+        }
+
+        if (sw_if_index > 0) {
+            SWSS_LOG_NOTICE("L3 VxLAN tunnel already exists in VPP: "
+                            "VNI=%u VRF=%u sw_if=%u src=%s dst=%s (reusing)",
+                            vni, vrf_id, sw_if_index, src_str, dst_str);
+            /* VRF binding persists from previous boot — no need to re-bind */
+        } else {
+            SWSS_LOG_ERROR("Failed to create L3 VxLAN tunnel: VNI=%u VRF=%u "
+                           "ret=%d (and no existing tunnel found in VPP)",
+                           vni, vrf_id, ret);
+            return SAI_STATUS_FAILURE;
+        }
+    }
+
+    if (sw_if_index == 0) {
+        SWSS_LOG_ERROR("L3 VxLAN tunnel returned sw_if_index=0 (local0)");
+        return SAI_STATUS_FAILURE;
+    }
+
+    // Add static neighbor for inner Ethernet header.
+    // Use the overlay BVI MAC (anycast gateway MAC) so that on decap the
+    // remote BVI's l2_to_bvi_dmac_check() accepts the inner frame.
+    uint8_t inner_dst_mac[6];
+    get_overlay_bvi_mac(inner_dst_mac);
+    vpp_ip_addr_t dst_vpp;
+    sai_ip_address_t dst_copy = dst;
+    sai_ip_address_t_to_vpp_ip_addr_t(dst_copy, dst_vpp);
+    ip4_nbr_add_del(NULL, sw_if_index, &dst_vpp.addr.ip4,
+                     false, true/*no_fib_entry*/, inner_dst_mac, 1);
+
+    L3TunnelVPPData data;
+    data.sw_if_index = sw_if_index;
+    data.vni = vni;
+    data.vrf_id = vrf_id;
+    data.src_ip = src;
+    data.dst_ip = dst;
+    data.tunnel_oid = tunnel_oid;
+
+    m_l3_tunnel_map[tunnel_oid] = data;
+
+    SWSS_LOG_NOTICE("Created L3 VxLAN: tunnel=%s VNI=%u VRF=%u sw_if=%u",
+        sai_serialize_object_id(tunnel_oid).c_str(), vni, vrf_id, sw_if_index);
+
+    /*
+     * Add a default deag (re-lookup) route in the overlay VRF so that
+     * VxLAN tunnel encap can resolve remote VTEP IPs through the underlay.
+     *
+     * Without this, the overlay VRF (table 1001) has no route to the
+     * remote VTEP loopback IPs, and VPP drops encapsulated packets.
+     * The deag route causes VPP to re-lookup in the underlay table (0)
+     * where BGP-learned routes to remote VTEPs exist.
+     *
+     * Skip for VRF 0 (underlay itself) to avoid recursive loops.
+     */
+    if (vrf_id != 0)
+    {
+        char deag_cmd[128];
+        snprintf(deag_cmd, sizeof(deag_cmd),
+                 "vppctl ip route add 0.0.0.0/0 table %u via ip4-lookup-in-table 0",
+                 vrf_id);
+        int deag_ret = system(deag_cmd);
+        if (deag_ret == 0)
+        {
+            SWSS_LOG_NOTICE("L3 VxLAN: added default deag route in VRF %u → table 0",
+                            vrf_id);
+        }
+        else
+        {
+            SWSS_LOG_WARN("L3 VxLAN: failed to add deag route in VRF %u (ret=%d)",
+                          vrf_id, deag_ret);
+        }
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t
+TunnelManager::remove_l3_vxlan_tunnel(
+    _In_ sai_object_id_t tunnel_oid)
+{
+    SWSS_LOG_ENTER();
+
+    auto it = m_l3_tunnel_map.find(tunnel_oid);
+    if (it == m_l3_tunnel_map.end()) {
+        SWSS_LOG_NOTICE("Tunnel %s not in L3 tunnel map, skipping removal",
+            sai_serialize_object_id(tunnel_oid).c_str());
+        return SAI_STATUS_SUCCESS;
+    }
+
+    L3TunnelVPPData& data = it->second;
+
+    // Remove static neighbor — use same overlay BVI MAC as creation
+    uint8_t inner_dst_mac[6];
+    get_overlay_bvi_mac(inner_dst_mac);
+    vpp_ip_addr_t dst_vpp;
+    sai_ip_address_t_to_vpp_ip_addr_t(data.dst_ip, dst_vpp);
+    ip4_nbr_add_del(NULL, data.sw_if_index, &dst_vpp.addr.ip4,
+                     false, true/*no_fib_entry*/, inner_dst_mac, 0);
+
+    int ret = vpp_l3_vxlan_tunnel_del(
+        data.sw_if_index, data.src_ip.addr.ip4, data.dst_ip.addr.ip4, data.vni);
+    if (ret != 0) {
+        SWSS_LOG_ERROR("Failed to delete L3 VxLAN tunnel sw_if=%u: ret=%d",
+            data.sw_if_index, ret);
+    }
+
+    SWSS_LOG_NOTICE("Removed L3 VxLAN tunnel %s (sw_if=%u, VNI=%u, VRF=%u)",
+        sai_serialize_object_id(tunnel_oid).c_str(),
+        data.sw_if_index, data.vni, data.vrf_id);
+
+    m_l3_tunnel_map.erase(it);
+
     return SAI_STATUS_SUCCESS;
 }

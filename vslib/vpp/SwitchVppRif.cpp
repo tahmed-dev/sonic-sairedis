@@ -385,6 +385,7 @@ void SwitchVpp::vppProcessEvents ()
     const struct timespec req = {2, 0};
     vpp_event_info_t *evp;
     int ret;
+    uint32_t fdb_poll_counter = 0;
 
     while(m_run_vpp_events_thread) {
         nanosleep(&req, NULL);
@@ -404,8 +405,21 @@ void SwitchVpp::vppProcessEvents ()
                                 evp->data.bfd_notif.sw_if_index,
                                 evp->data.bfd_notif.state);
                 asyncBfdStateUpdate(&evp->data.bfd_notif);
+            } else if (evp->type == VPP_L2_MAC_EVENT) {
+                SWSS_LOG_NOTICE("Received L2 MAC event: %u MACs",
+                                evp->data.l2_mac_event.n_macs);
+                vppProcessL2MacEvent(&evp->data.l2_mac_event);
             }
             vpp_ev_free(evp);
+        }
+
+        /* Periodic FDB poll as fallback — catches MACs that events may miss
+         * (e.g., MACs learned before event subscription was active).
+         * Runs every ~30 seconds (15 iterations * 2s sleep). */
+        fdb_poll_counter++;
+        if (fdb_poll_counter >= 15) {
+            fdb_poll_counter = 0;
+            vppPollFdb();
         }
     }
 }
@@ -479,10 +493,37 @@ sai_status_t SwitchVpp::asyncIntfStateUpdate(const char *hwif_name, bool link_up
 {
     SWSS_LOG_ENTER();
 
-    std::string tap_str;
-    const char *tap;
+    /* Bond interfaces (BondEthernet<N>) are not in sonic_vpp_ifmap.ini,
+     * so hwif_to_tap_name() cannot resolve them.  Resolve the LAG OID
+     * directly from m_lag_bond_map by matching the VPP sw_if_index. */
+    if (strncmp(hwif_name, "BondEthernet", 12) == 0)
+    {
+        uint32_t bond_swif = vpp_get_swif_idx(hwif_name);
+        std::lock_guard<std::mutex> lock(LagMapMutex);
 
-    tap = hwif_to_tap_name(hwif_name);
+        for (auto &kv : m_lag_bond_map)
+        {
+            if (kv.second.sw_if_index == bond_swif)
+            {
+                auto state = link_up ? SAI_PORT_OPER_STATUS_UP
+                                     : SAI_PORT_OPER_STATUS_DOWN;
+
+                SWSS_LOG_NOTICE("EVPN MH bond state event: %s (LAG %s) → %s",
+                    hwif_name,
+                    sai_serialize_object_id(kv.first).c_str(),
+                    link_up ? "UP" : "DOWN");
+
+                send_port_oper_status_notification(kv.first, state, false);
+                return SAI_STATUS_SUCCESS;
+            }
+        }
+
+        SWSS_LOG_NOTICE("Bond %s (sw_if=%u) not found in m_lag_bond_map",
+            hwif_name, bond_swif);
+        return SAI_STATUS_SUCCESS;
+    }
+
+    const char *tap = hwif_to_tap_name(hwif_name);
     auto port_oid = getPortIdFromIfName(std::string(tap));
 
     if (port_oid == SAI_NULL_OBJECT_ID) {
@@ -1016,13 +1057,181 @@ sai_status_t SwitchVpp::vpp_add_del_intf_ip_addr_norif (
 
     int ret = interface_ip_address_add_del(hw_ifname, &vpp_ip_prefix, is_add);
 
-    if (ret == 0)
+    /*
+     * For Vlan (BVI) interfaces, also program the bridge domain ARP termination
+     * table so VPP responds to ARP requests for the BVI's own IP address.
+     *
+     * Read the BVI MAC from the SAI RIF's SRC_MAC_ADDRESS attribute first
+     * (authoritative source — set by intfsorch from anycast_gateway_mac).
+     * Fall back to sysfs /sys/class/net/bvivlan<N>/address only if the SAI
+     * attribute is unavailable.  The previous sysfs-only approach was
+     * susceptible to a race: bvivlan<N> may still carry the system MAC when
+     * the IP is added, if the SRC_MAC_ADDRESS hasn't propagated to the LCP
+     * tap yet.  Reading the SAI attribute is always consistent.
+     */
+    if (full_if_name.compare(0, vlan_prefix.length(), vlan_prefix) == 0 && vlan_id > 0)
     {
-        return SAI_STATUS_SUCCESS;
+        uint8_t bvi_mac[6] = {};
+        bool mac_found = false;
+
+        /* Try SAI RIF SRC_MAC first (authoritative).
+         * This method (_norif) doesn't receive a RIF OID, so we look up
+         * the VLAN-type RIF whose VLAN_ID matches our vlan_id. */
+        try {
+            auto &rif_hash = m_objectHash.at(SAI_OBJECT_TYPE_ROUTER_INTERFACE);
+            for (auto &rif_pair : rif_hash)
+            {
+                sai_object_id_t rif_oid;
+                sai_deserialize_object_id(rif_pair.first, rif_oid);
+
+                sai_attribute_t type_attr;
+                type_attr.id = SAI_ROUTER_INTERFACE_ATTR_TYPE;
+                if (get(SAI_OBJECT_TYPE_ROUTER_INTERFACE, rif_oid, 1, &type_attr) != SAI_STATUS_SUCCESS
+                    || type_attr.value.s32 != SAI_ROUTER_INTERFACE_TYPE_VLAN)
+                    continue;
+
+                sai_attribute_t vlan_attr;
+                vlan_attr.id = SAI_ROUTER_INTERFACE_ATTR_VLAN_ID;
+                if (get(SAI_OBJECT_TYPE_ROUTER_INTERFACE, rif_oid, 1, &vlan_attr) != SAI_STATUS_SUCCESS)
+                    continue;
+
+                /* Resolve VLAN OID → VLAN ID */
+                sai_attribute_t vid_attr;
+                vid_attr.id = SAI_VLAN_ATTR_VLAN_ID;
+                if (get(SAI_OBJECT_TYPE_VLAN, vlan_attr.value.oid, 1, &vid_attr) != SAI_STATUS_SUCCESS)
+                    continue;
+
+                if ((uint32_t)vid_attr.value.u16 != (uint32_t)vlan_id)
+                    continue;
+
+                /* Found our RIF — read SRC_MAC */
+                sai_attribute_t rif_mac_attr;
+                rif_mac_attr.id = SAI_ROUTER_INTERFACE_ATTR_SRC_MAC_ADDRESS;
+                if (get(SAI_OBJECT_TYPE_ROUTER_INTERFACE, rif_oid, 1, &rif_mac_attr) == SAI_STATUS_SUCCESS)
+                {
+                    bool all_zero = true;
+                    for (int i = 0; i < 6; i++) {
+                        if (rif_mac_attr.value.mac[i] != 0) { all_zero = false; break; }
+                    }
+                    if (!all_zero) {
+                        memcpy(bvi_mac, rif_mac_attr.value.mac, 6);
+                        mac_found = true;
+                        SWSS_LOG_NOTICE("BD %d ARP term: using RIF SRC_MAC "
+                                        "%02x:%02x:%02x:%02x:%02x:%02x (from SAI attribute)",
+                                        vlan_id,
+                                        bvi_mac[0], bvi_mac[1], bvi_mac[2],
+                                        bvi_mac[3], bvi_mac[4], bvi_mac[5]);
+                    }
+                }
+                break;
+            }
+        } catch (const std::out_of_range&) {
+            /* No RIFs created yet — fall through to sysfs */
+        }
+
+        /* Fallback: read from sysfs (bvivlan<N>) */
+        if (!mac_found)
+        {
+            char sysfs_path[128];
+            snprintf(sysfs_path, sizeof(sysfs_path),
+                     "/sys/class/net/bvivlan%d/address", vlan_id);
+            FILE *fp = fopen(sysfs_path, "r");
+            if (fp) {
+                unsigned int m[6];
+                if (fscanf(fp, "%02x:%02x:%02x:%02x:%02x:%02x",
+                           &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
+                    for (int i = 0; i < 6; i++) bvi_mac[i] = (uint8_t)m[i];
+                    mac_found = true;
+                }
+                fclose(fp);
+            }
+            if (!mac_found) {
+                SWSS_LOG_WARN("Cannot read MAC for BD %d ARP term "
+                              "(SAI attribute and sysfs both failed)", vlan_id);
+            }
+        }
+
+        if (mac_found)
+        {
+            init_vpp_client();
+
+            switch (m_ip.getIp().family) {
+            case AF_INET:
+            {
+                uint32_t ip4 = m_ip.getV4Addr();
+                bd_ip_mac_add_del((uint32_t)vlan_id, AF_INET,
+                                  &ip4, sizeof(ip4), bvi_mac, is_add);
+                break;
+            }
+            case AF_INET6:
+            {
+                const uint8_t *ip6 = m_ip.getV6Addr();
+                bd_ip_mac_add_del((uint32_t)vlan_id, AF_INET6,
+                                  ip6, 16, bvi_mac, is_add);
+                break;
+            }
+            }
+            SWSS_LOG_NOTICE("BD %d ARP term %s for BVI IP on %s",
+                            vlan_id, is_add ? "add" : "del",
+                            full_if_name.c_str());
+        }
     }
-    else {
+
+    /*
+     * Add the BVI IP to the LCP tap (bvivlan<N>) in addition to Vlan<N>.
+     *
+     * SONiC's intfmgrd assigns the IP to the kernel's Vlan<N> interface.
+     * VPP punts L3 traffic via the BVI's LCP tap (bvivlan<N>), so the IP
+     * must also be present there.
+     *
+     * Keep the IP on BOTH interfaces:
+     *   - bvivlan<N>: VPP data-plane L3 traffic (BVI punt path)
+     *   - Vlan<N>:    FRR EVPN neighbor install (dplane_local_neigh_add
+     *                 requires an IPv4 address on the SVI for the kernel
+     *                 to accept RTM_NEWNEIGH entries)
+     *
+     * The kernel prefers bvivlan<N> for forwarding (lower metric / more
+     * specific connected route) so duplicate-subnet routing is not an
+     * issue in practice.
+     */
+    if (full_if_name.compare(0, vlan_prefix.length(), vlan_prefix) == 0 && vlan_id > 0)
+    {
+        char cmd[256];
+        char ip_str[INET6_ADDRSTRLEN];
+        int prefix_len = intf_ip_prefix.getMaskLength();
+
+        if (m_ip.getIp().family == AF_INET) {
+            uint32_t ip4 = m_ip.getV4Addr();
+            inet_ntop(AF_INET, &ip4, ip_str, sizeof(ip_str));
+        } else {
+            const uint8_t *ip6 = m_ip.getV6Addr();
+            inet_ntop(AF_INET6, ip6, ip_str, sizeof(ip_str));
+        }
+
+        /* Add/remove on the LCP tap (bvivlan<N>) */
+        snprintf(cmd, sizeof(cmd), "ip addr %s %s/%d dev bvivlan%u 2>/dev/null",
+                 is_add ? "add" : "del", ip_str, prefix_len, vlan_id);
+        if (system(cmd) != 0) {
+            SWSS_LOG_WARN("Failed to %s IP on bvivlan%u",
+                          is_add ? "add" : "remove", vlan_id);
+        }
+
+        /* Keep IP on Vlan<N> — do NOT remove it.  FRR's zebra resolves the
+         * EVPN SVI as Vlan<N> (ZEBRA_IF_VLAN) and installs MH sync
+         * neighbors there via dplane_local_neigh_add().  The kernel rejects
+         * RTM_NEWNEIGH if the interface has no IPv4 address. */
+
+        SWSS_LOG_NOTICE("BVI LCP tap IP %s on bvivlan%u (also kept on Vlan%u)",
+                        is_add ? "added" : "removed", vlan_id, vlan_id);
+    }
+
+    if (ret != 0)
+    {
+        SWSS_LOG_ERROR("interface_ip_address_add_del failed for %s (ret=%d)", hw_ifname, ret);
         return SAI_STATUS_FAILURE;
     }
+
+    return SAI_STATUS_SUCCESS;
 }
 
 enum class LpbOpType {
