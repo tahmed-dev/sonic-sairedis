@@ -187,12 +187,21 @@ sai_status_t SwitchVpp::vpp_create_vlan_member(
         //Create bridge and set the l2 port
         set_sw_interface_l2_bridge(hw_ifname,bridge_id, true, VPP_API_PORT_TYPE_NORMAL);
 
-        //Set the vlan member to bridge and tags rewrite
-        vpp_l2_vtr_op_t vtr_op = L2_VTR_PUSH_1;
-        vpp_vlan_type_t push_dot1q = VLAN_DOT1Q;
-        uint32_t tag1 = (uint32_t)vlan_id;
-        uint32_t tag2 = ~0;
-        set_l2_interface_vlan_tag_rewrite(hw_ifname, tag1, tag2, push_dot1q, vtr_op);
+        /*
+         * Do NOT set VTR (VLAN Tag Rewrite) for untagged access ports.
+         *
+         * The previous code set L2_VTR_PUSH_1 here, which pushes a dot1q
+         * VLAN tag on BOTH L2 input and output directions in VPP.  This
+         * causes frames inside the bridge domain to carry an unexpected
+         * VLAN tag.  When the BD forwards such a frame to the BVI and the
+         * LCP (Linux Control Plane) tap delivers it to the kernel, the
+         * kernel's VLAN interface (e.g. Vlan10) sees a double-tagged frame
+         * and drops it silently.
+         *
+         * For untagged (access) ports the wire carries untagged frames and
+         * the port is already classified into the correct BD by its
+         * membership alone — no tag manipulation is needed.
+         */
     }
     else {
         SWSS_LOG_ERROR("Tagging Mode %d not implemented", tagging_mode);
@@ -343,14 +352,6 @@ sai_status_t SwitchVpp::vpp_remove_vlan_member(
     char host_subifname[32];
     if (tagging_mode == SAI_VLAN_TAGGING_MODE_UNTAGGED)
     {
-
-        //First disable tag-rewrite.
-        vpp_l2_vtr_op_t vtr_op =L2_VTR_DISABLED;
-        vpp_vlan_type_t push_dot1q = VLAN_DOT1Q;
-        uint32_t tag1 = (uint32_t)vlan_id;
-        uint32_t tag2 = ~0;
-        set_l2_interface_vlan_tag_rewrite(hw_ifname, tag1, tag2, push_dot1q, vtr_op);
-
         //Remove interface from bridge, interface type should be changed to others types like l3.
         set_sw_interface_l2_bridge(hw_ifname, bridge_id, false, VPP_API_PORT_TYPE_NORMAL);
     }
@@ -484,10 +485,38 @@ sai_status_t SwitchVpp::vpp_create_bvi_interface(
         configure_lcp_interface(bvi_ifname, host_ifname, true);
 
         /* Bring the LCP tap interface up */
-        char cmd[128];
+        char cmd[256];
         snprintf(cmd, sizeof(cmd), "ip link set %s up", host_ifname);
         if (system(cmd) != 0) {
             SWSS_LOG_WARN("Failed to bring up %s", host_ifname);
+        }
+
+        /*
+         * Enable promiscuous mode on the BVI tap.  The BVI uses the anycast
+         * gateway MAC (e.g. 00:00:5e:00:01:01) which differs from the host
+         * interface's default MAC.  Without promisc, the kernel filters
+         * incoming frames whose dst MAC doesn't match the interface MAC,
+         * silently dropping punted L3 traffic.
+         */
+        snprintf(cmd, sizeof(cmd), "ip link set %s promisc on", host_ifname);
+        if (system(cmd) != 0) {
+            SWSS_LOG_WARN("Failed to set promisc on %s", host_ifname);
+        }
+
+        /*
+         * Disable reverse-path filtering on the BVI tap and globally.
+         * VPP punts packets via the tap whose source addresses may not
+         * match any route on the kernel's routing table for that interface,
+         * causing rp_filter to drop them silently.  Setting 'default' ensures
+         * future interfaces also get rp_filter=0.
+         */
+        snprintf(cmd, sizeof(cmd),
+                 "sysctl -qw net.ipv4.conf.all.rp_filter=0 "
+                 "net.ipv4.conf.default.rp_filter=0 "
+                 "net.ipv4.conf.%s.rp_filter=0",
+                 host_ifname);
+        if (system(cmd) != 0) {
+            SWSS_LOG_WARN("Failed to disable rp_filter on %s", host_ifname);
         }
     }
 
