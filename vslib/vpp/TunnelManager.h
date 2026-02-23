@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <map>
 #include "SwitchVpp.h"
 #include "vppxlate/SaiVppXlate.h"
 
@@ -17,12 +18,42 @@ namespace saivs
      */
     class TunnelVPPData {
     public:
-        TunnelVPPData() : sw_if_index(0), encap_vrf_id(0) {}
-        u_int32_t sw_if_index;
-        u_int32_t encap_vrf_id;
-        u_int32_t bd_id;
-        vpp_ip_addr_t bvi_addr;
+        TunnelVPPData() {
+            memset(&src_ip, 0, sizeof(src_ip));
+            memset(&dst_ip, 0, sizeof(dst_ip));
+            memset(&bvi_addr, 0, sizeof(bvi_addr));
+        }
+        // Common fields
+        u_int32_t sw_if_index = 0;
         std::shared_ptr<IpVrfInfo> ip_vrf;
+
+        u_int32_t encap_vrf_id = 0;
+        u_int32_t bd_id = 0;
+        vpp_ip_addr_t bvi_addr;
+
+        // L2 VXLAN fields
+        u_int32_t vni = 0;
+        u_int16_t vlan_id = 0;
+        sai_ip_address_t src_ip;
+        sai_ip_address_t dst_ip;
+    };
+
+    /**
+     * @brief L3 VxLAN tunnel data — tunnel bound to a VRF (not a bridge domain).
+     */
+    struct L3TunnelVPPData {
+        uint32_t sw_if_index = 0;
+        uint32_t vni = 0;
+        uint32_t vrf_id = 0;           // VPP FIB table ID
+        sai_ip_address_t src_ip;
+        sai_ip_address_t dst_ip;
+        sai_object_id_t tunnel_oid;
+
+        L3TunnelVPPData() {
+            memset(&src_ip, 0, sizeof(src_ip));
+            memset(&dst_ip, 0, sizeof(dst_ip));
+            tunnel_oid = SAI_NULL_OBJECT_ID;
+        }
     };
 
     class TunnelManager {
@@ -100,16 +131,126 @@ namespace saivs
          * @brief Set VxLAN port.
          */
         void set_vxlan_port(const sai_attribute_t* attr);
+
+        /**
+         * @brief Create L2 VXLAN tunnel for EVPN.
+         *
+         * This function is called when a SAI P2P tunnel object is created,
+         * typically triggered by EVPN discovering a remote VTEP via BGP IMET routes.
+         *
+         * @param tunnel_oid The SAI tunnel object ID.
+         * @param sw_if_index Output parameter for the VPP interface index.
+         * @return SAI_STATUS_SUCCESS on success or if skipped (P2MP tunnel),
+         *         error status on failure.
+         */
+        sai_status_t create_l2_vxlan_tunnel(
+            _In_ sai_object_id_t tunnel_oid,
+            _Out_ uint32_t& sw_if_index);
+        
+        sai_status_t remove_l2_vxlan_tunnel(
+            _In_ sai_object_id_t tunnel_oid);
+
+        /**
+         * @brief Look up VPP sw_if_index for an L2 VxLAN tunnel by SAI tunnel OID.
+         * @return true if found, sw_if_index populated; false otherwise.
+         */
+        bool getL2TunnelSwIfIndex(sai_object_id_t tunnelOid, uint32_t &sw_if_index) const
+        {
+            auto it = m_l2_tunnel_map.find(tunnelOid);
+            if (it == m_l2_tunnel_map.end())
+                return false;
+            sw_if_index = it->second.sw_if_index;
+            return true;
+        }
+
+        /**
+         * @brief Look up VPP sw_if_index and VLAN ID for an L2 VxLAN tunnel.
+         * @return true if found; false otherwise.
+         */
+        bool getL2TunnelInfo(sai_object_id_t tunnelOid, uint32_t &sw_if_index, uint16_t &vlan_id) const
+        {
+            auto it = m_l2_tunnel_map.find(tunnelOid);
+            if (it == m_l2_tunnel_map.end())
+                return false;
+            sw_if_index = it->second.sw_if_index;
+            vlan_id = it->second.vlan_id;
+            return true;
+        }
+
+        /**
+         * @brief Create an L3 VxLAN tunnel bound to a VRF FIB table.
+         *
+         * Unlike L2 tunnels which are added to a bridge domain, L3 tunnels are
+         * placed into a VRF so that routed traffic can be encapsulated in VxLAN.
+         *
+         * @param tunnel_oid SAI tunnel object ID.
+         * @param vni VxLAN Network Identifier (L3 VNI).
+         * @param vrf_id VPP FIB table ID for the overlay VRF.
+         * @param src Source VTEP IP address.
+         * @param dst Destination (remote) VTEP IP address.
+         * @return SAI_STATUS_SUCCESS on success.
+         */
+        sai_status_t create_l3_vxlan_tunnel(
+            _In_ sai_object_id_t tunnel_oid,
+            _In_ uint32_t vni,
+            _In_ uint32_t vrf_id,
+            _In_ const sai_ip_address_t &src,
+            _In_ const sai_ip_address_t &dst);
+
+        /**
+         * @brief Remove an L3 VxLAN tunnel.
+         */
+        sai_status_t remove_l3_vxlan_tunnel(
+            _In_ sai_object_id_t tunnel_oid);
+
+        /**
+         * @brief Look up L3 VxLAN tunnel data by SAI tunnel OID.
+         * @return true if found, data populated; false otherwise.
+         */
+        bool getL3TunnelInfo(sai_object_id_t tunnelOid, L3TunnelVPPData &data) const
+        {
+            auto it = m_l3_tunnel_map.find(tunnelOid);
+            if (it == m_l3_tunnel_map.end())
+                return false;
+            data = it->second;
+            return true;
+        }
+
     private:
         SwitchVpp* m_switch_db;
         std::array<uint8_t, 6> m_router_mac;
         u_int16_t m_vxlan_port;
         //nexthop SAI object ID to sw_if_index map
         std::unordered_map<sai_object_id_t, TunnelVPPData> m_tunnel_encap_nexthop_map;
+        // Map from tunnel SAI OID to VPP tunnel data (L2 VXLAN / EVPN)
+        std::unordered_map<sai_object_id_t, TunnelVPPData> m_l2_tunnel_map;
+        // Map from tunnel SAI OID to L3 VxLAN tunnel data (VRF-bound)
+        std::map<sai_object_id_t, L3TunnelVPPData> m_l3_tunnel_map;
 
         sai_status_t tunnel_encap_nexthop_action(
                         _In_ const SaiObject* tunnel_nh_obj,
                         _In_ Action action);
+
+        /**
+         * @brief Get the overlay BVI MAC (anycast gateway MAC) for VxLAN inner
+         *        Ethernet header.
+         *
+         * Scans VLAN-type RIFs for SAI_ROUTER_INTERFACE_ATTR_SRC_MAC_ADDRESS.
+         * This MAC is used as the inner dst MAC in L3 VxLAN encapsulation so
+         * that on decap the remote BVI's l2_to_bvi_dmac_check() accepts the
+         * frame.  Falls back to m_router_mac if no anycast MAC is found.
+         *
+         * @param[out] mac  6-byte MAC address to fill.
+         * @return true if anycast MAC found, false if using fallback.
+         */
+        bool get_overlay_bvi_mac(_Out_ uint8_t mac[6]) const;
+
+        /**
+         * @brief Find an existing VxLAN tunnel in m_l3_tunnel_map matching src/dst/VNI.
+         * @return pair<true, sw_if_index> if found, pair<false, 0> otherwise.
+         */
+        std::pair<bool, uint32_t> find_existing_vxlan_tunnel(
+                        _In_ const vpp_vxlan_tunnel_t& req);
 
         sai_status_t create_vpp_vxlan_encap(
                         _In_  vpp_vxlan_tunnel_t& req,

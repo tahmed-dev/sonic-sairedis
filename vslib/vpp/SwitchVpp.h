@@ -422,6 +422,10 @@ namespace saivs
                     _In_ sai_object_id_t next_hop_grp_oid,
                     _Out_ nexthop_grp_config_t **nxthop_group);
 
+            sai_status_t IpRouteNexthopGroupProtection(
+                    _In_ sai_object_id_t next_hop_grp_oid,
+                    _Out_ nexthop_grp_config_t **nxthop_group);
+
             sai_status_t IpRouteNexthopEntry(
                     _In_ sai_object_id_t next_hop_oid,
                     _Out_ nexthop_grp_config_t **nxthop_group_cfg);
@@ -443,6 +447,10 @@ namespace saivs
 
             sai_status_t removeNexthopGroupMember(
                     _In_ const std::string& serializedObjectId);
+
+            sai_status_t setNexthopGroupMember(
+                    _In_ const std::string& serializedObjectId,
+                    _In_ const sai_attribute_t* attr);
 
         protected: // VPP
 
@@ -918,6 +926,34 @@ namespace saivs
             void vppProcessEvents ();
 
             void startVppEventsThread();
+
+            void vppPollFdb();
+
+            void vppProcessL2MacEvent(
+                    _In_ const vpp_l2_mac_event_t *event);
+
+        private: // VPP - FDB polling state
+
+            struct VppFdbKey {
+                uint32_t bd_id;
+                uint8_t mac[6];
+
+                bool operator<(const VppFdbKey &other) const {
+                    if (bd_id != other.bd_id) return bd_id < other.bd_id;
+                    return memcmp(mac, other.mac, 6) < 0;
+                }
+                bool operator==(const VppFdbKey &other) const {
+                    return bd_id == other.bd_id && memcmp(mac, other.mac, 6) == 0;
+                }
+            };
+
+            struct VppFdbValue {
+                uint32_t sw_if_index;
+                bool static_mac;
+                bool bvi_mac;
+            };
+
+            std::map<VppFdbKey, VppFdbValue> m_vpp_fdb_cache;
 
         private: // VPP
 

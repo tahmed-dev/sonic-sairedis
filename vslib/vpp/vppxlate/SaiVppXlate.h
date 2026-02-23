@@ -127,14 +127,37 @@ extern "C" {
         vpp_api_bfd_state_e state;
     } vpp_bfd_state_notif_t;
 
+    /* L2 MAC event from VPP l2fib */
+    typedef enum {
+        VPP_L2_MAC_EVENT_ACTION_ADD = 0,
+        VPP_L2_MAC_EVENT_ACTION_DELETE = 1,
+        VPP_L2_MAC_EVENT_ACTION_MOVE = 2,
+    } vpp_l2_mac_event_action_e;
+
+    #define VPP_L2_MAC_EVENT_MAX_MACS 64
+
+    typedef struct vpp_l2_mac_event_entry_ {
+        uint32_t sw_if_index;
+        uint8_t mac[6];
+        uint8_t action; /* vpp_l2_mac_event_action_e */
+        uint8_t flags;
+    } vpp_l2_mac_event_entry_t;
+
+    typedef struct vpp_l2_mac_event_ {
+        uint32_t n_macs;
+        vpp_l2_mac_event_entry_t entries[VPP_L2_MAC_EVENT_MAX_MACS];
+    } vpp_l2_mac_event_t;
+
     typedef enum {
 	VPP_INTF_LINK_STATUS = 1,
         VPP_BFD_STATE_CHANGE,
+        VPP_L2_MAC_EVENT,
     } vpp_event_type_e;
 
     typedef union vpp_event_data_ {
        vpp_intf_status_t     intf_status;
        vpp_bfd_state_notif_t bfd_notif;
+       vpp_l2_mac_event_t    l2_mac_event;
     } vpp_event_data_t;
 
     typedef struct vpp_my_sid_entry_ {
@@ -298,22 +321,51 @@ typedef enum {
     extern int interface_get_state(const char *hwif_name, bool *link_is_up);
     extern int vpp_sync_for_events();
     extern int vpp_bridge_domain_add_del(uint32_t bridge_id, bool is_add);
+    extern int set_l2_interface_flags(uint32_t sw_if_index, uint32_t feature_bitmap, bool is_set);
     extern int set_sw_interface_l2_bridge(const char *hwif_name, uint32_t bridge_id, bool l2_enable, uint32_t port_type);
+    extern int set_sw_interface_l2_bridge_with_shg(const char *hwif_name, uint32_t bridge_id, bool l2_enable, uint32_t port_type, uint32_t shg);
     extern int set_sw_interface_l2_bridge_by_index(uint32_t sw_if_index, uint32_t bridge_id, bool l2_enable, uint32_t port_type);
+    extern int set_sw_interface_l2_bridge_by_index_with_shg(uint32_t sw_if_index, uint32_t bridge_id, bool l2_enable, uint32_t port_type, uint32_t shg);
     extern int set_l2_interface_vlan_tag_rewrite(const char *hwif_name, uint32_t tag1, uint32_t tag2, uint32_t push_dot1q, uint32_t vtr_op);
     extern int bridge_domain_get_member_count (uint32_t bd_id, uint32_t *member_count);
     extern int create_bvi_interface(uint8_t *mac_address, uint32_t instance);
     extern int delete_bvi_interface(const char *hwif_name);
     extern int set_bridge_domain_flags(uint32_t bd_id, vpp_bd_flags_t flag, bool enable);
+
+    extern int bd_ip_mac_add_del(uint32_t bd_id, int af,
+				 const void *ip_addr, size_t ip_len,
+				 const uint8_t *mac, bool is_add);
     extern int create_bond_interface(uint32_t bond_id, uint32_t mode, uint32_t lb, uint32_t *swif_idx);
     extern int delete_bond_interface(const char *hwif_name);
     extern int create_bond_member(uint32_t bond_sw_if_index, const char *hwif_name, bool is_passive, bool is_long_timeout);
     extern int delete_bond_member(const char * hwif_name);
     extern const char * vpp_get_swif_name(const uint32_t swif_idx);
+    extern uint32_t vpp_get_swif_idx(const char *ifname);
     extern int l2fib_add_del(const char *hwif_name, const uint8_t *mac, uint32_t bd_id, bool is_add, bool is_static_mac);
     extern int l2fib_flush_all();
     extern int l2fib_flush_int(const char *hwif_name);
     extern int l2fib_flush_bd(uint32_t bd_id);
+
+    /* L2 FIB table dump for MAC learning events */
+    #define VPP_L2FIB_MAX_ENTRIES 4096
+
+    typedef struct vpp_l2fib_entry_ {
+        uint32_t bd_id;
+        uint8_t mac[6];
+        uint32_t sw_if_index;
+        bool static_mac;
+        bool filter_mac;
+        bool bvi_mac;
+    } vpp_l2fib_entry_t;
+
+    typedef struct vpp_l2fib_dump_result_ {
+        vpp_l2fib_entry_t entries[VPP_L2FIB_MAX_ENTRIES];
+        uint32_t count;
+    } vpp_l2fib_dump_result_t;
+
+    extern int l2fib_table_dump(uint32_t bd_id, vpp_l2fib_dump_result_t *result);
+
+    extern int l2_macs_events_enable_disable(bool enable, uint8_t max_macs_in_event);
     extern int bfd_udp_add(bool multihop, const char *hwif_name, vpp_ip_addr_t *local_addr,
                            vpp_ip_addr_t *peer_addr, uint8_t detect_mult,
                            uint32_t desired_min_tx, uint32_t required_min_rx);
@@ -321,6 +373,10 @@ typedef enum {
                            vpp_ip_addr_t *peer_addr);
 
     extern int vpp_vxlan_tunnel_add_del(vpp_vxlan_tunnel_t *tunnel, bool is_add,  uint32_t *sw_if_index);
+    extern int vpp_l3_vxlan_tunnel_add(uint32_t src_ip, uint32_t dst_ip, uint32_t vni, uint32_t vrf_id, uint32_t *sw_if_index);
+    extern int vpp_l3_vxlan_tunnel_del(uint32_t sw_if_index, uint32_t src_ip, uint32_t dst_ip, uint32_t vni);
+    extern int vpp_set_interface_vrf_by_index(uint32_t sw_if_index, uint32_t vrf_id, bool is_ipv6);
+    extern int vpp_interface_set_state_by_index(uint32_t sw_if_index, bool is_up);
     extern int vpp_ip_addr_t_to_string(vpp_ip_addr_t *ip_addr, char *buffer, size_t maxlen);
     extern int vpp_my_sid_entry_add_del(vpp_my_sid_entry_t *my_sid, bool is_del);
     extern int vpp_sidlist_add(vpp_sidlist_t *sidlist);
