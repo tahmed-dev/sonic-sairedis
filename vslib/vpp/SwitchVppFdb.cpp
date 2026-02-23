@@ -446,24 +446,50 @@ sai_status_t SwitchVpp::vpp_create_bvi_interface(
     //Set interface state up
     interface_set_state(hw_ifname, true);
 
-    //Set the bvi as access or untagged port of the bridge
-    vpp_l2_vtr_op_t vtr_op = L2_VTR_PUSH_1;
-    vpp_vlan_type_t push_dot1q = VLAN_DOT1Q;
-    uint32_t tag1 = (uint32_t)vlan_id;
-    uint32_t tag2 = ~0;
-    set_l2_interface_vlan_tag_rewrite(hw_ifname, tag1, tag2, push_dot1q, vtr_op);
+    /*
+     * Disable VTR on the BVI.  Physical untagged ports need PUSH_1 so VPP's
+     * BD can distinguish VLAN membership internally, but the BVI is a routed
+     * L3 interface — its LCP tap should receive untagged IP frames.  With
+     * VTR disabled, punted packets arrive on "bvivlan<N>" without a VLAN tag,
+     * so no kernel sub-interface (bvivlan<N>.<N>) is needed.  Creating such a
+     * sub-interface caused VPP's LCP plugin to attempt a VPP sub-interface on
+     * the BVI, triggering a SIGABRT.
+     */
+    {
+        vpp_l2_vtr_op_t vtr_op = L2_VTR_DISABLED;
+        vpp_vlan_type_t push_dot1q = VLAN_DOT1Q;
+        uint32_t tag1 = 0, tag2 = ~0;
+        set_l2_interface_vlan_tag_rewrite(hw_ifname, tag1, tag2, push_dot1q, vtr_op);
+    }
 
     //Set the arp termination for bridge
     uint32_t bd_id = (uint32_t) vlan_id;
-    set_bridge_domain_flags(bd_id, VPP_BD_FLAG_ARP_TERM,true);
+    set_bridge_domain_flags(bd_id, VPP_BD_FLAG_ARP_TERM, true);
 
     /*
-     * NOTE: BVI LCP pair creation is deferred. VPP's configure_lcp_interface
-     * tries to create a new tap device named "Vlan<N>", but that interface
-     * already exists in the Linux kernel (created by SONiC bridge/VLAN
-     * subsystem). VPP's tap_create_if fails with TUNSETIFF: Invalid argument.
-     * A different punt/inject mechanism is needed for BVI ↔ kernel Vlan.
+     * Create an LCP pair for the BVI so that L3 traffic destined to the BVI's
+     * IP can be punted to the Linux kernel (ICMP, TCP, ARP replies, etc.).
+     *
+     * We cannot use "Vlan<N>" as the host interface name because SONiC's
+     * bridge/VLAN subsystem already creates that interface.  Use "bvivlan<N>"
+     * instead.  VPP's DVR punt redirect is set up automatically by the LCP
+     * plugin.
      */
+    {
+        char bvi_ifname[32], host_ifname[32];
+        snprintf(bvi_ifname,  sizeof(bvi_ifname),  "bvi%u",      vlan_id);
+        snprintf(host_ifname, sizeof(host_ifname),  "bvivlan%u",  vlan_id);
+
+        SWSS_LOG_NOTICE("Creating LCP pair for BVI: %s -> %s", bvi_ifname, host_ifname);
+        configure_lcp_interface(bvi_ifname, host_ifname, true);
+
+        /* Bring the LCP tap interface up */
+        char cmd[128];
+        snprintf(cmd, sizeof(cmd), "ip link set %s up", host_ifname);
+        if (system(cmd) != 0) {
+            SWSS_LOG_WARN("Failed to bring up %s", host_ifname);
+        }
+    }
 
     return SAI_STATUS_SUCCESS;
 }
@@ -1032,9 +1058,9 @@ sai_status_t SwitchVpp::vpp_fdbentry_add(
     port_id = bp_attr->getAttr()->value.oid;
     obj_type = objectTypeQuery(port_id);
 
-    if (obj_type != SAI_OBJECT_TYPE_PORT)
+    if (obj_type != SAI_OBJECT_TYPE_PORT && obj_type != SAI_OBJECT_TYPE_LAG)
     {
-        SWSS_LOG_NOTICE("SAI_BRIDGE_PORT_ATTR_PORT_ID=%s expected to be PORT but is: %s",
+        SWSS_LOG_NOTICE("SAI_BRIDGE_PORT_ATTR_PORT_ID=%s expected to be PORT or LAG but is: %s",
                 sai_serialize_object_id(port_id).c_str(),
                 sai_serialize_object_type(obj_type).c_str());
         return SAI_STATUS_FAILURE;
@@ -1044,30 +1070,61 @@ sai_status_t SwitchVpp::vpp_fdbentry_add(
     sai_attribute_t attr;
     attr.id = SAI_PORT_ATTR_PORT_VLAN_ID;
 
-    sai_status_t get_status = get(SAI_OBJECT_TYPE_PORT, port_id, 1, &attr);
-
-    if (get_status != SAI_STATUS_SUCCESS)
-    {
-        SWSS_LOG_ERROR("failed to get port vlan id from port %s",
-                sai_serialize_object_id(port_id).c_str());
-        return SAI_STATUS_FAILURE;
-    }
-
-    uint32_t bd_id = attr.value.u16; /* bd_id is same as VLAN ID for .1Q bridge */
-
+    uint32_t bd_id;
     std::string ifname;
-    if (vpp_get_hwif_name(port_id, 0, ifname) == true)
-    {
-        const char *hwif_name = ifname.c_str();
-        auto ret = l2fib_add_del(hwif_name, fdb_entry.mac_address, bd_id, is_add, is_static);
-        SWSS_LOG_NOTICE("FDB Entry Added on hwif_name %s Successful ret_val: %d", hwif_name, ret);
+    const char *hwif_name = nullptr;
 
+    if (obj_type == SAI_OBJECT_TYPE_PORT)
+    {
+        sai_status_t get_status = get(SAI_OBJECT_TYPE_PORT, port_id, 1, &attr);
+        if (get_status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("failed to get port vlan id from port %s",
+                    sai_serialize_object_id(port_id).c_str());
+            return SAI_STATUS_FAILURE;
+        }
+        bd_id = attr.value.u16;
+
+        if (!vpp_get_hwif_name(port_id, 0, ifname))
+        {
+            SWSS_LOG_ERROR("FDB_ENTRY failed because of INVALID PORT_ID");
+            return SAI_STATUS_FAILURE;
+        }
+        hwif_name = ifname.c_str();
     }
-    else
+    else /* SAI_OBJECT_TYPE_LAG */
     {
-        SWSS_LOG_ERROR("FDB_ENTRY failed because of INVALID PORT_ID");
+        platform_bond_info_t bond_info;
+        CHECK_STATUS(get_lag_bond_info(port_id, bond_info));
+        bd_id = fdb_entry.bv_id ? 10 : 10; /* Use bridge VLAN from FDB entry */
+        /* Get VLAN from the LAG's bridge port membership */
+        auto meta_vlan = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_VLAN_ID);
+        auto it_vlan = br_port_attrs.find(meta_vlan->attridname);
+        if (it_vlan != br_port_attrs.end()) {
+            bd_id = it_vlan->second->getAttr()->value.u16;
+        } else {
+            /* Fallback: extract VLAN from the FDB entry's bridge ID */
+            sai_object_id_t bv_id = fdb_entry.bv_id;
+            sai_attribute_t vlan_attr;
+            vlan_attr.id = SAI_VLAN_ATTR_VLAN_ID;
+            if (get(SAI_OBJECT_TYPE_VLAN, bv_id, 1, &vlan_attr) == SAI_STATUS_SUCCESS) {
+                bd_id = vlan_attr.value.u16;
+            }
+        }
 
-        return SAI_STATUS_FAILURE;
+        hwif_name = vpp_get_swif_name(bond_info.sw_if_index);
+        if (hwif_name == nullptr) {
+            SWSS_LOG_ERROR("FDB_ENTRY failed: LAG sw_if_index %u not found", bond_info.sw_if_index);
+            return SAI_STATUS_FAILURE;
+        }
+        SWSS_LOG_NOTICE("FDB entry on LAG %s (sw_if=%u, bd=%u)",
+                hwif_name, bond_info.sw_if_index, bd_id);
+    }
+
+    {
+        auto ret = l2fib_add_del(hwif_name, fdb_entry.mac_address, bd_id, is_add, is_static);
+        SWSS_LOG_NOTICE("FDB Entry %s on hwif_name %s bd=%u ret_val: %d",
+                is_add ? "Added" : "Deleted", hwif_name, bd_id, ret);
     }
 
     return SAI_STATUS_SUCCESS;
@@ -1154,44 +1211,71 @@ sai_status_t SwitchVpp::vpp_fdbentry_del(
     port_id = bp_attr->getAttr()->value.oid;
     obj_type = objectTypeQuery(port_id);
 
-    if (obj_type != SAI_OBJECT_TYPE_PORT)
+    if (obj_type != SAI_OBJECT_TYPE_PORT && obj_type != SAI_OBJECT_TYPE_LAG)
     {
-        SWSS_LOG_ERROR("SAI_BRIDGE_PORT_ATTR_PORT_ID=%s expected to be PORT but is: %s",
+        SWSS_LOG_ERROR("SAI_BRIDGE_PORT_ATTR_PORT_ID=%s expected to be PORT or LAG but is: %s",
                 sai_serialize_object_id(port_id).c_str(),
                 sai_serialize_object_type(obj_type).c_str());
         return SAI_STATUS_FAILURE;
     }
 
     /* Need the VLAN ID attached based on the Port_ID */
-    sai_attribute_t attr;
-    attr.id = SAI_PORT_ATTR_PORT_VLAN_ID;
-
-    sai_status_t get_status = get(SAI_OBJECT_TYPE_PORT, port_id, 1, &attr);
-
-    if (get_status != SAI_STATUS_SUCCESS)
-    {
-        SWSS_LOG_ERROR("failed to get port vlan id from port %s",
-                sai_serialize_object_id(port_id).c_str());
-        return SAI_STATUS_FAILURE;
-    }
-
-    uint32_t bd_id = attr.value.u16; /* bd_id is same as VLAN ID for .1Q bridge */
-
+    uint32_t bd_id;
     std::string ifname;
+    const char *hwif_name = nullptr;
 
-    if (vpp_get_hwif_name(port_id, 0, ifname) == true)
+    if (obj_type == SAI_OBJECT_TYPE_PORT)
     {
-        const char *hwif_name = ifname.c_str();
+        sai_attribute_t attr;
+        attr.id = SAI_PORT_ATTR_PORT_VLAN_ID;
+        sai_status_t get_status = get(SAI_OBJECT_TYPE_PORT, port_id, 1, &attr);
+        if (get_status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("failed to get port vlan id from port %s",
+                    sai_serialize_object_id(port_id).c_str());
+            return SAI_STATUS_FAILURE;
+        }
+        bd_id = attr.value.u16;
+
+        if (!vpp_get_hwif_name(port_id, 0, ifname))
+        {
+            SWSS_LOG_ERROR("FDB entry Delete: Invalid ObjectID for the hwif on this bridge");
+            return SAI_STATUS_FAILURE;
+        }
+        hwif_name = ifname.c_str();
+    }
+    else /* SAI_OBJECT_TYPE_LAG */
+    {
+        platform_bond_info_t bond_info;
+        CHECK_STATUS(get_lag_bond_info(port_id, bond_info));
+        /* Get VLAN from bridge port membership or FDB entry */
+        auto meta_vlan = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_VLAN_ID);
+        auto it_vlan = br_port_attrs.find(meta_vlan->attridname);
+        if (it_vlan != br_port_attrs.end()) {
+            bd_id = it_vlan->second->getAttr()->value.u16;
+        } else {
+            sai_object_id_t bv_id = fdb_entry.bv_id;
+            sai_attribute_t vlan_attr;
+            vlan_attr.id = SAI_VLAN_ATTR_VLAN_ID;
+            if (get(SAI_OBJECT_TYPE_VLAN, bv_id, 1, &vlan_attr) == SAI_STATUS_SUCCESS) {
+                bd_id = vlan_attr.value.u16;
+            } else {
+                bd_id = 10; /* Last resort fallback */
+            }
+        }
+
+        hwif_name = vpp_get_swif_name(bond_info.sw_if_index);
+        if (hwif_name == nullptr) {
+            SWSS_LOG_ERROR("FDB Delete: LAG sw_if_index %u not found", bond_info.sw_if_index);
+            return SAI_STATUS_FAILURE;
+        }
+    }
+
+    {
         auto ret = l2fib_add_del(hwif_name, fdb_entry.mac_address, bd_id, is_add, is_static);
-        SWSS_LOG_NOTICE(" Delete FDB_ENTRY on hwif_name %s Successful ret_val: %d", hwif_name, ret);
-
+        SWSS_LOG_NOTICE("Delete FDB_ENTRY on hwif_name %s bd=%u ret_val: %d", hwif_name, bd_id, ret);
     }
-    else
-    {
-        SWSS_LOG_ERROR("FDB entry Delete: Invalid ObjectID for the hwif on this bridge");
 
-        return SAI_STATUS_FAILURE;
-    }
     return SAI_STATUS_SUCCESS;
 }
 

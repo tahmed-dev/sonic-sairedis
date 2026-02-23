@@ -1439,6 +1439,32 @@ sai_status_t SwitchVpp::set_internal(
     // set have only one attribute
     attrHash[a->getAttrMetadata()->attridname] = a;
 
+    /*
+     * When proxy_arp is enabled on a VLAN interface, intfsorch sets the
+     * broadcast/multicast flood control type to NONE.  In VPP, this maps
+     * to enabling arp-ufwd on the bridge domain so that ARP requests for
+     * unknown IPs are forwarded (flooded/punted) instead of silently dropped
+     * by ARP termination.
+     */
+    if (objectType == SAI_OBJECT_TYPE_VLAN &&
+        (attr->id == SAI_VLAN_ATTR_BROADCAST_FLOOD_CONTROL_TYPE ||
+         attr->id == SAI_VLAN_ATTR_UNKNOWN_MULTICAST_FLOOD_CONTROL_TYPE))
+    {
+        /* Resolve VLAN ID from object hash */
+        auto md_vlan_id = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_VLAN, SAI_VLAN_ATTR_VLAN_ID);
+        auto vlan_id_it = attrHash.find(md_vlan_id->attridname);
+        if (vlan_id_it != attrHash.end())
+        {
+            uint32_t vlan_id = (uint32_t)vlan_id_it->second->getAttr()->value.u16;
+            bool enable_ufwd = (attr->value.s32 == SAI_VLAN_FLOOD_CONTROL_TYPE_NONE);
+
+            SWSS_LOG_NOTICE("VLAN %u: %s arp-ufwd (flood_control=%d)",
+                            vlan_id, enable_ufwd ? "enabling" : "disabling",
+                            attr->value.s32);
+            set_bridge_domain_flags(vlan_id, VPP_BD_FLAG_ARP_UFWD, enable_ufwd);
+        }
+    }
+
     return SAI_STATUS_SUCCESS;
 }
 

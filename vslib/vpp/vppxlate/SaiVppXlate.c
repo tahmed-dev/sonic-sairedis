@@ -912,6 +912,17 @@ vl_api_bridge_flags_reply_t_handler (vl_api_bridge_flags_reply_t *msg)
 }
 
 static void
+vl_api_l2_flags_reply_t_handler (vl_api_l2_flags_reply_t *msg)
+{
+    int retval = (int)ntohl((uint32_t)msg->retval);
+    set_reply_status(retval);
+
+    SAIVPP_WARN("l2 flags reply handler  %s(%d) resulting_bitmap=0x%x",
+        retval ? "failed" : "successful", retval,
+        ntohl(msg->resulting_feature_bitmap));
+}
+
+static void
 vl_api_l2fib_add_del_reply_t_handler (vl_api_l2fib_add_del_reply_t *msg)
 {
     int retval = (int)ntohl((uint32_t)msg->retval);
@@ -1351,6 +1362,7 @@ static void vpp_base_vpe_init(void)
     _(L2_MSG_ID(BVI_CREATE_REPLY), bvi_create_reply) \
     _(L2_MSG_ID(BVI_DELETE_REPLY), bvi_delete_reply) \
     _(L2_MSG_ID(BRIDGE_FLAGS_REPLY), bridge_flags_reply) \
+    _(L2_MSG_ID(L2_FLAGS_REPLY), l2_flags_reply) \
     _(BOND_MSG_ID(BOND_CREATE_REPLY), bond_create_reply) \
     _(BOND_MSG_ID(BOND_DELETE_REPLY), bond_delete_reply) \
     _(BOND_MSG_ID(BOND_ADD_MEMBER_REPLY), bond_add_member_reply) \
@@ -2972,9 +2984,13 @@ int vpp_bridge_domain_add_del(uint32_t bridge_id, bool is_add)
 }
 int set_sw_interface_l2_bridge_by_index(uint32_t sw_if_index, uint32_t bridge_id, bool l2_mode, uint32_t port_type)
 {
+    return set_sw_interface_l2_bridge_by_index_with_shg(sw_if_index, bridge_id, l2_mode, port_type, 0);
+}
+
+int set_sw_interface_l2_bridge_by_index_with_shg(uint32_t sw_if_index, uint32_t bridge_id, bool l2_mode, uint32_t port_type, uint32_t shg)
+{
     vat_main_t *vam = &vat_main;
     vl_api_sw_interface_set_l2_bridge_t *mp;
-    u32 shg = 0;
     int ret;
 
     VPP_LOCK();
@@ -3007,6 +3023,11 @@ int set_sw_interface_l2_bridge_by_index(uint32_t sw_if_index, uint32_t bridge_id
 
 int set_sw_interface_l2_bridge(const char *hwif_name, uint32_t bridge_id, bool l2_mode, uint32_t port_type)
 {
+    return set_sw_interface_l2_bridge_with_shg(hwif_name, bridge_id, l2_mode, port_type, 0);
+}
+
+int set_sw_interface_l2_bridge_with_shg(const char *hwif_name, uint32_t bridge_id, bool l2_mode, uint32_t port_type, uint32_t shg)
+{
     vat_main_t *vam = &vat_main;
 
     if (hwif_name) {
@@ -3014,7 +3035,7 @@ int set_sw_interface_l2_bridge(const char *hwif_name, uint32_t bridge_id, bool l
 
         idx = get_swif_idx(vam, hwif_name);
         if (idx != (u32) -1) {
-            return set_sw_interface_l2_bridge_by_index(idx, bridge_id, l2_mode, port_type);
+            return set_sw_interface_l2_bridge_by_index_with_shg(idx, bridge_id, l2_mode, port_type, shg);
         } else {
             SAIVPP_ERROR("Unable to get sw_index for %s\n", hwif_name);
             return -EINVAL;
@@ -3185,6 +3206,33 @@ int set_bridge_domain_flags(uint32_t bd_id, vpp_bd_flags_t flag, bool enable)
     mp->bd_id = htonl(bd_id);
     mp->is_set = enable;
     mp->flags = htonl(flag);
+    S (mp);
+
+    W (ret);
+
+    VPP_UNLOCK();
+
+    return ret;
+}
+
+int set_l2_interface_flags(uint32_t sw_if_index, uint32_t feature_bitmap, bool is_set)
+{
+    vat_main_t *vam = &vat_main;
+    vl_api_l2_flags_t *mp;
+    int ret;
+
+    SAIVPP_WARN("Setting L2 interface flags: sw_if_index=%u bitmap=0x%x is_set=%d\n",
+        sw_if_index, feature_bitmap, is_set);
+    VPP_LOCK();
+
+    __plugin_msg_base = l2_msg_id_base;
+
+    M (L2_FLAGS, mp);
+
+    mp->sw_if_index = htonl(sw_if_index);
+    mp->is_set = is_set;
+    mp->feature_bitmap = htonl(feature_bitmap);
+
     S (mp);
 
     W (ret);

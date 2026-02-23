@@ -260,6 +260,19 @@ TunnelManager::create_vpp_vxlan_encap(
     SWSS_LOG_INFO("create vxlan tunnel src %s dst %s vni %d: sw_if_index,%d, status %d",
             src_ip_str, dst_ip_str,
             req.vni, sw_if_index, vpp_status);
+
+    // If creation returned sw_if_index 0, the tunnel may already exist from a
+    // previous boot (docker commit persists VPP state).  Delete and re-create
+    // to get the correct sw_if_index.
+    if (vpp_status == 0 && sw_if_index == 0) {
+        SWSS_LOG_NOTICE("VxLAN tunnel add returned sw_if_index=0, deleting stale tunnel and retrying");
+        u_int32_t dummy_idx = 0;
+        vpp_vxlan_tunnel_add_del(&req, 0, &dummy_idx);  // delete
+        vpp_status = vpp_vxlan_tunnel_add_del(&req, 1, &sw_if_index);  // re-create
+        SWSS_LOG_NOTICE("VxLAN tunnel re-create: sw_if_index=%d, status=%d",
+                sw_if_index, vpp_status);
+    }
+
     if (vpp_status != 0) {
         SWSS_LOG_ERROR("Failed to create vxlan tunnel");
         return SAI_STATUS_FAILURE;
@@ -549,10 +562,25 @@ TunnelManager::create_l2_vxlan_tunnel(
         return SAI_STATUS_FAILURE;
     }
 
-    // Add tunnel interface to bridge domain (VLAN)
+    // Guard against sw_if_index=0 — VPP's local0 loopback.  If the VxLAN
+    // encap creation returned 0, it silently failed (e.g. BGP hasn't resolved
+    // the remote VTEP yet).  Adding local0 to a BD corrupts forwarding.
+    if (tunnel_data.sw_if_index == 0) {
+        SWSS_LOG_ERROR("VxLAN tunnel creation returned sw_if_index=0 (local0), aborting BD add");
+        return SAI_STATUS_FAILURE;
+    }
+
+    // Add tunnel interface to bridge domain (VLAN) with SHG=1
+    // SHG (Split Horizon Group) isolation: local ports use SHG=0, tunnel uses SHG=1.
+    // This prevents BUM traffic from flooding local→tunnel during steady state.
+    // Known unicast forwarding via static L2FIB entries bypasses SHG, so failover
+    // reroute (MAC → tunnel) works without removing the SHG barrier.
+    // This models the future ASIC protection-group behavior where the tunnel is
+    // pre-provisioned as a backup path but inactive for BUM until failover.
     if (vlan_id != 0) {
-        int vpp_status = set_sw_interface_l2_bridge_by_index(
-            tunnel_data.sw_if_index, vlan_id, true, VPP_API_PORT_TYPE_NORMAL);
+        const uint32_t tunnel_shg = 1;
+        int vpp_status = set_sw_interface_l2_bridge_by_index_with_shg(
+            tunnel_data.sw_if_index, vlan_id, true, VPP_API_PORT_TYPE_NORMAL, tunnel_shg);
         if (vpp_status != 0) {
             SWSS_LOG_ERROR("Failed to add tunnel sw_if %u to BD %u",
                 tunnel_data.sw_if_index, vlan_id);
@@ -560,7 +588,19 @@ TunnelManager::create_l2_vxlan_tunnel(
             remove_vpp_vxlan_encap(req, tunnel_data);
             return SAI_STATUS_FAILURE;
         }
-        SWSS_LOG_NOTICE("Added tunnel sw_if %u to BD %u", tunnel_data.sw_if_index, vlan_id);
+        SWSS_LOG_NOTICE("Added tunnel sw_if %u to BD %u with SHG=%u",
+            tunnel_data.sw_if_index, vlan_id, tunnel_shg);
+
+        // NOTE: Do NOT call set_l2_interface_flags() to disable learning on the
+        // tunnel port. VPP's l2_flags API corrupts the per-interface l2-output
+        // feature config, causing SIGSEGV in l2output_node_fn_icl when the first
+        // BUM packet floods through the tunnel. (VPP v2510 bug.)
+        //
+        // Tunnel learning is harmless in EVPN MH:
+        // - Remote MACs learned on tunnel are correct (reachable via peer VTEP)
+        // - Local MACs always win on local ports (more frequent traffic)
+        // - SHG=1 prevents tunnel→tunnel BUM loops
+        // - Our event handler already skips tunnel-learned MACs for SAI FDB events
     }
 
     m_l2_tunnel_map[tunnel_oid] = tunnel_data;
