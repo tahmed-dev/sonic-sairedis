@@ -910,6 +910,34 @@ namespace saivs
 
             void startVppEventsThread();
 
+            void vppPollFdb();
+
+            void vppProcessL2MacEvent(
+                    _In_ const vpp_l2_mac_event_t *event);
+
+        private: // VPP - FDB polling state
+
+            struct VppFdbKey {
+                uint32_t bd_id;
+                uint8_t mac[6];
+
+                bool operator<(const VppFdbKey &other) const {
+                    if (bd_id != other.bd_id) return bd_id < other.bd_id;
+                    return memcmp(mac, other.mac, 6) < 0;
+                }
+                bool operator==(const VppFdbKey &other) const {
+                    return bd_id == other.bd_id && memcmp(mac, other.mac, 6) == 0;
+                }
+            };
+
+            struct VppFdbValue {
+                uint32_t sw_if_index;
+                bool static_mac;
+                bool bvi_mac;
+            };
+
+            std::map<VppFdbKey, VppFdbValue> m_vpp_fdb_cache;
+
         private: // VPP
 
             std::map<std::string, std::string> m_hostif_hwif_map;

@@ -385,6 +385,7 @@ void SwitchVpp::vppProcessEvents ()
     const struct timespec req = {2, 0};
     vpp_event_info_t *evp;
     int ret;
+    uint32_t fdb_poll_counter = 0;
 
     while(m_run_vpp_events_thread) {
         nanosleep(&req, NULL);
@@ -404,8 +405,21 @@ void SwitchVpp::vppProcessEvents ()
                                 evp->data.bfd_notif.sw_if_index,
                                 evp->data.bfd_notif.state);
                 asyncBfdStateUpdate(&evp->data.bfd_notif);
+            } else if (evp->type == VPP_L2_MAC_EVENT) {
+                SWSS_LOG_NOTICE("Received L2 MAC event: %u MACs",
+                                evp->data.l2_mac_event.n_macs);
+                vppProcessL2MacEvent(&evp->data.l2_mac_event);
             }
             vpp_ev_free(evp);
+        }
+
+        /* Periodic FDB poll as fallback — catches MACs that events may miss
+         * (e.g., MACs learned before event subscription was active).
+         * Runs every ~30 seconds (15 iterations * 2s sleep). */
+        fdb_poll_counter++;
+        if (fdb_poll_counter >= 15) {
+            fdb_poll_counter = 0;
+            vppPollFdb();
         }
     }
 }
@@ -1016,13 +1030,60 @@ sai_status_t SwitchVpp::vpp_add_del_intf_ip_addr_norif (
 
     int ret = interface_ip_address_add_del(hw_ifname, &vpp_ip_prefix, is_add);
 
-    if (ret == 0)
+    /*
+     * For Vlan (BVI) interfaces, also program the bridge domain ARP termination
+     * table so VPP responds to ARP requests for the BVI's own IP address.
+     * Read the BVI MAC from the kernel Vlan interface.
+     */
+    if (full_if_name.compare(0, vlan_prefix.length(), vlan_prefix) == 0 && vlan_id > 0)
     {
-        return SAI_STATUS_SUCCESS;
+        uint8_t bvi_mac[6] = {};
+        char sysfs_path[128];
+        snprintf(sysfs_path, sizeof(sysfs_path),
+                 "/sys/class/net/%s/address", full_if_name.c_str());
+        FILE *fp = fopen(sysfs_path, "r");
+        if (fp) {
+            unsigned int m[6];
+            if (fscanf(fp, "%02x:%02x:%02x:%02x:%02x:%02x",
+                       &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
+                for (int i = 0; i < 6; i++) bvi_mac[i] = (uint8_t)m[i];
+
+                init_vpp_client();
+
+                switch (m_ip.getIp().family) {
+                case AF_INET:
+                {
+                    uint32_t ip4 = m_ip.getV4Addr();
+                    bd_ip_mac_add_del((uint32_t)vlan_id, AF_INET,
+                                      &ip4, sizeof(ip4), bvi_mac, is_add);
+                    break;
+                }
+                case AF_INET6:
+                {
+                    const uint8_t *ip6 = m_ip.getV6Addr();
+                    bd_ip_mac_add_del((uint32_t)vlan_id, AF_INET6,
+                                      ip6, 16, bvi_mac, is_add);
+                    break;
+                }
+                }
+                SWSS_LOG_NOTICE("BD %d ARP term %s for BVI IP on %s",
+                                vlan_id, is_add ? "add" : "del",
+                                full_if_name.c_str());
+            }
+            fclose(fp);
+        } else {
+            SWSS_LOG_WARN("Cannot read MAC from %s for BD ARP term",
+                          sysfs_path);
+        }
     }
-    else {
+
+    if (ret != 0)
+    {
+        SWSS_LOG_ERROR("interface_ip_address_add_del failed for %s (ret=%d)", hw_ifname, ret);
         return SAI_STATUS_FAILURE;
     }
+
+    return SAI_STATUS_SUCCESS;
 }
 
 enum class LpbOpType {

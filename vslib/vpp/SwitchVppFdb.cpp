@@ -1,4 +1,5 @@
 #include "SwitchVpp.h"
+#include "FdbInfo.h"
 
 #include "swss/exec.h"
 
@@ -9,6 +10,9 @@
 #include "vppxlate/SaiVppXlate.h"
 
 #include "SwitchVppUtils.h"
+
+#include <memory>
+#include <set>
 
 using namespace saivs;
 
@@ -68,10 +72,21 @@ sai_status_t SwitchVpp::vpp_create_vlan_member(
         return SAI_STATUS_FAILURE;
     }
 
+    auto br_port_attrs = m_objectHash.at(SAI_OBJECT_TYPE_BRIDGE_PORT).at(sai_serialize_object_id(br_port_id));
+    auto meta_type = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_TYPE);
+    auto it_type = br_port_attrs.find(meta_type->attridname);
+    if (it_type != br_port_attrs.end()) {
+        sai_bridge_port_type_t bp_type = (sai_bridge_port_type_t)it_type->second->getAttr()->value.s32;
+        if (bp_type == SAI_BRIDGE_PORT_TYPE_TUNNEL) {
+            SWSS_LOG_NOTICE("Skipping VLAN member VPP ops for tunnel bridge port %s",
+                sai_serialize_object_id(br_port_id).c_str());
+            return SAI_STATUS_SUCCESS;
+        }
+    }
+
     const char *hwifname = nullptr;
     uint32_t lag_swif_idx;
 
-    auto br_port_attrs = m_objectHash.at(SAI_OBJECT_TYPE_BRIDGE_PORT).at(sai_serialize_object_id(br_port_id));
     auto meta = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_PORT_ID);
     auto bp_attr = br_port_attrs[meta->attridname];
     auto port_id = bp_attr->getAttr()->value.oid;
@@ -264,6 +279,19 @@ sai_status_t SwitchVpp::vpp_remove_vlan_member(
 
     const char *hw_ifname = nullptr;
     auto br_port_attrs = m_objectHash.at(SAI_OBJECT_TYPE_BRIDGE_PORT).at(sai_serialize_object_id(br_port_oid));
+
+    /* Check bridge port type — skip TUNNEL ports (VxLAN), they don't have
+       SAI_BRIDGE_PORT_ATTR_PORT_ID and would segfault on dereference. */
+    auto bp_type_meta = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_TYPE);
+    auto bp_type_attr = br_port_attrs[bp_type_meta->attridname];
+
+    if (bp_type_attr && bp_type_attr->getAttr()->value.s32 == SAI_BRIDGE_PORT_TYPE_TUNNEL)
+    {
+        SWSS_LOG_NOTICE("Skipping vlan member remove for TUNNEL bridge port %s",
+                sai_serialize_object_id(br_port_oid).c_str());
+        return SAI_STATUS_SUCCESS;
+    }
+
     auto meta = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_PORT_ID);
     auto bp_attr = br_port_attrs[meta->attridname];
     auto port_id = bp_attr->getAttr()->value.oid;
@@ -428,6 +456,14 @@ sai_status_t SwitchVpp::vpp_create_bvi_interface(
     //Set the arp termination for bridge
     uint32_t bd_id = (uint32_t) vlan_id;
     set_bridge_domain_flags(bd_id, VPP_BD_FLAG_ARP_TERM,true);
+
+    /*
+     * NOTE: BVI LCP pair creation is deferred. VPP's configure_lcp_interface
+     * tries to create a new tap device named "Vlan<N>", but that interface
+     * already exists in the Linux kernel (created by SONiC bridge/VLAN
+     * subsystem). VPP's tap_create_if fails with TUNSETIFF: Invalid argument.
+     * A different punt/inject mechanism is needed for BVI ↔ kernel Vlan.
+     */
 
     return SAI_STATUS_SUCCESS;
 }
@@ -975,6 +1011,22 @@ sai_status_t SwitchVpp::vpp_fdbentry_add(
     }
 
     auto br_port_attrs = m_objectHash.at(SAI_OBJECT_TYPE_BRIDGE_PORT).at(sai_serialize_object_id(br_port_id));
+
+    /* Check bridge port type — tunnel bridge ports don't have PORT_ID,
+     * they have TUNNEL_ID. Skip VPP FDB ops for tunnel ports. */
+    {
+        auto meta_bp_type = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_TYPE);
+        auto it_bp_type = br_port_attrs.find(meta_bp_type->attridname);
+        if (it_bp_type != br_port_attrs.end()) {
+            sai_bridge_port_type_t bp_type = (sai_bridge_port_type_t)it_bp_type->second->getAttr()->value.s32;
+            if (bp_type == SAI_BRIDGE_PORT_TYPE_TUNNEL) {
+                SWSS_LOG_NOTICE("vpp_fdbentry_add: Skipping VPP FDB ops for tunnel bridge port %s",
+                    sai_serialize_object_id(br_port_id).c_str());
+                return SAI_STATUS_SUCCESS;
+            }
+        }
+    }
+
     auto meta = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_PORT_ID);
     auto bp_attr = br_port_attrs[meta->attridname];
     port_id = bp_attr->getAttr()->value.oid;
@@ -1082,6 +1134,21 @@ sai_status_t SwitchVpp::vpp_fdbentry_del(
     }
 
     auto br_port_attrs = m_objectHash.at(SAI_OBJECT_TYPE_BRIDGE_PORT).at(sai_serialize_object_id(br_port_id));
+
+    /* Check bridge port type — tunnel bridge ports don't have PORT_ID. */
+    {
+        auto meta_bp_type = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_TYPE);
+        auto it_bp_type = br_port_attrs.find(meta_bp_type->attridname);
+        if (it_bp_type != br_port_attrs.end()) {
+            sai_bridge_port_type_t bp_type = (sai_bridge_port_type_t)it_bp_type->second->getAttr()->value.s32;
+            if (bp_type == SAI_BRIDGE_PORT_TYPE_TUNNEL) {
+                SWSS_LOG_NOTICE("vpp_fdbentry_remove: Skipping VPP FDB ops for tunnel bridge port %s",
+                    sai_serialize_object_id(br_port_id).c_str());
+                return SAI_STATUS_SUCCESS;
+            }
+        }
+    }
+
     auto meta = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_PORT_ID);
     auto bp_attr = br_port_attrs[meta->attridname];
     port_id = bp_attr->getAttr()->value.oid;
@@ -1202,6 +1269,19 @@ sai_status_t SwitchVpp::vpp_fdbentry_flush(
         case FLUSH_BY_INTERFACE | FLUSH_ALL:/*flush by interface*/
             {
                 auto br_port_attrs = m_objectHash.at(SAI_OBJECT_TYPE_BRIDGE_PORT).at(sai_serialize_object_id(br_port_id));
+
+                /* Check bridge port type — tunnel bridge ports don't have PORT_ID. */
+                auto meta_bp_type = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_TYPE);
+                auto it_bp_type = br_port_attrs.find(meta_bp_type->attridname);
+                if (it_bp_type != br_port_attrs.end()) {
+                    sai_bridge_port_type_t bp_type = (sai_bridge_port_type_t)it_bp_type->second->getAttr()->value.s32;
+                    if (bp_type == SAI_BRIDGE_PORT_TYPE_TUNNEL) {
+                        SWSS_LOG_NOTICE("vpp_fdb_flush: Skipping flush for tunnel bridge port %s",
+                            sai_serialize_object_id(br_port_id).c_str());
+                        return SAI_STATUS_SUCCESS;
+                    }
+                }
+
                 auto meta = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_PORT_ID);
                 auto bp_attr = br_port_attrs[meta->attridname];
                 port_id = bp_attr->getAttr()->value.oid;
@@ -1255,4 +1335,598 @@ sai_status_t SwitchVpp::vpp_fdbentry_flush(
     }
 
     return SAI_STATUS_SUCCESS;
+}
+
+/*
+ * vppPollFdb - Poll VPP l2fib and generate SAI FDB events
+ *
+ * This function dumps all L2 FIB entries from VPP bridge domains,
+ * compares them with a local cache, and generates SAI_FDB_EVENT_LEARNED
+ * or SAI_FDB_EVENT_AGED notifications for changes.
+ *
+ * VPP learns MACs in its own userspace dataplane (l2fib) but the SAI
+ * virtual switch layer never sees these packets. This polling bridges
+ * the gap, making VPP-learned MACs visible to SONiC's fdborch.
+ */
+void SwitchVpp::vppPollFdb()
+{
+    SWSS_LOG_ENTER();
+
+    /* Build maps to resolve VPP sw_if_index → SAI bridge port info.
+     *
+     * For physical ports/LAGs: hwif_name → BridgePortInfo  (via vpp_get_swif_name)
+     * For VxLAN tunnels:       sw_if_index → BridgePortInfo (via TunnelManager)
+     *
+     * Tunnel interfaces aren't in VPP's name hash (populated at sw_interface_dump
+     * time, before tunnels are created), so we use sw_if_index directly. */
+
+    struct BridgePortInfo {
+        sai_object_id_t portId;       /* port/lag OID or tunnel OID for tunnels */
+        sai_object_id_t bridgePortId;
+        bool isTunnel;
+        uint16_t vlanId;              /* set for tunnel BPs (from TunnelManager) */
+    };
+
+    std::map<std::string, BridgePortInfo> hwif_to_bp;    /* physical ports/LAGs */
+    std::map<uint32_t, BridgePortInfo>    swif_to_bp;    /* tunnel bridge ports */
+
+    auto &bpHash = m_objectHash.at(SAI_OBJECT_TYPE_BRIDGE_PORT);
+
+    for (auto &kv : bpHash)
+    {
+        sai_object_id_t bpId;
+        sai_deserialize_object_id(kv.first, bpId);
+
+        /* Get bridge port type */
+        sai_attribute_t attr;
+        attr.id = SAI_BRIDGE_PORT_ATTR_TYPE;
+        if (get(SAI_OBJECT_TYPE_BRIDGE_PORT, bpId, 1, &attr) != SAI_STATUS_SUCCESS)
+            continue;
+
+        auto bpType = (sai_bridge_port_type_t)attr.value.s32;
+
+        if (bpType == SAI_BRIDGE_PORT_TYPE_TUNNEL)
+        {
+            /* Resolve tunnel bridge port via TunnelManager — use sw_if_index
+             * directly since VPP's name hash doesn't know dynamic tunnels */
+            attr.id = SAI_BRIDGE_PORT_ATTR_TUNNEL_ID;
+            if (get(SAI_OBJECT_TYPE_BRIDGE_PORT, bpId, 1, &attr) != SAI_STATUS_SUCCESS)
+                continue;
+
+            sai_object_id_t tunnelOid = attr.value.oid;
+            uint32_t sw_if_index = 0;
+            uint16_t vlan_id = 0;
+            if (!m_tunnel_mgr.getL2TunnelInfo(tunnelOid, sw_if_index, vlan_id))
+                continue;
+
+            BridgePortInfo info;
+            info.portId = tunnelOid;
+            info.bridgePortId = bpId;
+            info.isTunnel = true;
+            info.vlanId = vlan_id;
+            swif_to_bp[sw_if_index] = info;
+            continue;
+        }
+
+        /* Get the port/lag OID */
+        attr.id = SAI_BRIDGE_PORT_ATTR_PORT_ID;
+        if (get(SAI_OBJECT_TYPE_BRIDGE_PORT, bpId, 1, &attr) != SAI_STATUS_SUCCESS)
+            continue;
+
+        sai_object_id_t portId = attr.value.oid;
+
+        /* Resolve to VPP hw interface name */
+        std::string hwif;
+        if (!vpp_get_hwif_name(portId, 0, hwif))
+            continue;
+
+        BridgePortInfo info;
+        info.portId = portId;
+        info.bridgePortId = bpId;
+        info.isTunnel = false;
+        info.vlanId = 0;
+        hwif_to_bp[hwif] = info;
+    }
+
+    if (hwif_to_bp.empty() && swif_to_bp.empty())
+    {
+        return; /* no bridge ports configured yet */
+    }
+
+    /* Build a set of all active BD IDs (VLAN IDs) from SAI VLANs */
+    std::set<uint32_t> active_bds;
+
+    auto &vlanHash = m_objectHash.at(SAI_OBJECT_TYPE_VLAN);
+    for (auto &kv : vlanHash)
+    {
+        sai_object_id_t vlanOid;
+        sai_deserialize_object_id(kv.first, vlanOid);
+
+        sai_attribute_t attr;
+        attr.id = SAI_VLAN_ATTR_VLAN_ID;
+        if (get(SAI_OBJECT_TYPE_VLAN, vlanOid, 1, &attr) == SAI_STATUS_SUCCESS)
+        {
+            active_bds.insert(attr.value.u16);
+        }
+    }
+
+    if (active_bds.empty())
+    {
+        return;
+    }
+
+    /* Dump l2fib for each active BD and build the new FDB map */
+    std::map<VppFdbKey, VppFdbValue> new_fdb;
+
+    auto dumpResult = std::make_unique<vpp_l2fib_dump_result_t>();
+
+    for (uint32_t bd_id : active_bds)
+    {
+        memset(dumpResult.get(), 0, sizeof(vpp_l2fib_dump_result_t));
+
+        int rc = l2fib_table_dump(bd_id, dumpResult.get());
+        if (rc != 0)
+        {
+            SWSS_LOG_WARN("l2fib_table_dump failed for BD %u: %d", bd_id, rc);
+            continue;
+        }
+
+        for (uint32_t i = 0; i < dumpResult->count; i++)
+        {
+            auto &e = dumpResult->entries[i];
+
+            /* Skip BVI (gateway) and filter entries */
+            if (e.bvi_mac || e.filter_mac)
+                continue;
+
+            /* Skip static entries — those were programmed by SONiC, not learned */
+            if (e.static_mac)
+                continue;
+
+            VppFdbKey key;
+            key.bd_id = e.bd_id;
+            memcpy(key.mac, e.mac, 6);
+
+            VppFdbValue val;
+            val.sw_if_index = e.sw_if_index;
+            val.static_mac = e.static_mac;
+            val.bvi_mac = e.bvi_mac;
+
+            new_fdb[key] = val;
+        }
+    }
+
+    /* Diff: find newly learned MACs (in new_fdb but not in cache) */
+    for (auto &kv : new_fdb)
+    {
+        auto it = m_vpp_fdb_cache.find(kv.first);
+        if (it != m_vpp_fdb_cache.end() && it->second.sw_if_index == kv.second.sw_if_index)
+            continue; /* already known, same port */
+
+        /* New or moved MAC — generate SAI_FDB_EVENT_LEARNED */
+
+        /* Resolve sw_if_index → bridge port info.
+         * First check tunnel map (direct sw_if_index key), then fall back to
+         * hwif name map for physical ports. */
+        const BridgePortInfo *bp_info = nullptr;
+        const char *port_name = nullptr;
+
+        auto swif_it = swif_to_bp.find(kv.second.sw_if_index);
+        if (swif_it != swif_to_bp.end())
+        {
+            /* Skip tunnel-learned MACs — remote MACs should come via EVPN
+             * control plane (BGP Type-2 → fdbsyncd), not SAI FDB events.
+             * VPP learns them on the data plane for local forwarding only. */
+            SWSS_LOG_DEBUG("vppPollFdb: skipping tunnel-learned MAC sw_if_index %u", kv.second.sw_if_index);
+            continue;
+        }
+        else
+        {
+            const char *hwif = vpp_get_swif_name(kv.second.sw_if_index);
+            if (!hwif)
+            {
+                SWSS_LOG_WARN("vppPollFdb: cannot resolve sw_if_index %u", kv.second.sw_if_index);
+                continue;
+            }
+            port_name = hwif;
+
+            auto bp_it = hwif_to_bp.find(std::string(hwif));
+            if (bp_it == hwif_to_bp.end())
+            {
+                SWSS_LOG_DEBUG("vppPollFdb: hwif %s not mapped to bridge port, skipping", hwif);
+                continue;
+            }
+            bp_info = &bp_it->second;
+        }
+
+        /* Find the VLAN OID for this BD */
+        sai_object_id_t bv_id = SAI_NULL_OBJECT_ID;
+        for (auto &vkv : vlanHash)
+        {
+            sai_object_id_t vlanOid;
+            sai_deserialize_object_id(vkv.first, vlanOid);
+            sai_attribute_t attr;
+            attr.id = SAI_VLAN_ATTR_VLAN_ID;
+            if (get(SAI_OBJECT_TYPE_VLAN, vlanOid, 1, &attr) == SAI_STATUS_SUCCESS)
+            {
+                if (attr.value.u16 == kv.first.bd_id)
+                {
+                    bv_id = vlanOid;
+                    break;
+                }
+            }
+        }
+
+        if (bv_id == SAI_NULL_OBJECT_ID)
+        {
+            SWSS_LOG_WARN("vppPollFdb: cannot find VLAN OID for BD %u", kv.first.bd_id);
+            continue;
+        }
+
+        /* Build FdbInfo and generate event */
+        FdbInfo fi;
+        fi.setPortId(bp_info->portId);
+        fi.setVlanId((sai_vlan_id_t)kv.first.bd_id);
+        fi.m_bridgePortId = bp_info->bridgePortId;
+        fi.m_fdbEntry.switch_id = m_switch_id;
+        fi.m_fdbEntry.bv_id = bv_id;
+        memcpy(fi.m_fdbEntry.mac_address, kv.first.mac, sizeof(sai_mac_t));
+        fi.setTimestamp((uint32_t)time(NULL));
+
+        m_fdb_info_set.insert(fi);
+
+        SWSS_LOG_NOTICE("vppPollFdb: LEARNED mac=%02x:%02x:%02x:%02x:%02x:%02x bd=%u port=%s",
+                kv.first.mac[0], kv.first.mac[1], kv.first.mac[2],
+                kv.first.mac[3], kv.first.mac[4], kv.first.mac[5],
+                kv.first.bd_id, port_name);
+
+        processFdbInfo(fi, SAI_FDB_EVENT_LEARNED);
+    }
+
+    /* Diff: find aged MACs (in cache but not in new_fdb) */
+    for (auto &kv : m_vpp_fdb_cache)
+    {
+        if (new_fdb.find(kv.first) != new_fdb.end())
+            continue; /* still present */
+
+        /* MAC disappeared from VPP — generate SAI_FDB_EVENT_AGED */
+
+        /* Skip tunnel-learned MACs (same as LEARNED path) */
+        auto swif_it = swif_to_bp.find(kv.second.sw_if_index);
+        if (swif_it != swif_to_bp.end())
+            continue;
+
+        /* Resolve sw_if_index → bridge port info (physical ports only) */
+        sai_object_id_t portId = SAI_NULL_OBJECT_ID;
+        sai_object_id_t bpId = SAI_NULL_OBJECT_ID;
+
+        {
+            const char *hwif = vpp_get_swif_name(kv.second.sw_if_index);
+            if (hwif)
+            {
+                auto bp_it = hwif_to_bp.find(std::string(hwif));
+                if (bp_it != hwif_to_bp.end())
+                {
+                    portId = bp_it->second.portId;
+                    bpId = bp_it->second.bridgePortId;
+                }
+            }
+        }
+
+        /* Find VLAN OID */
+        sai_object_id_t bv_id = SAI_NULL_OBJECT_ID;
+        for (auto &vkv : vlanHash)
+        {
+            sai_object_id_t vlanOid;
+            sai_deserialize_object_id(vkv.first, vlanOid);
+            sai_attribute_t attr;
+            attr.id = SAI_VLAN_ATTR_VLAN_ID;
+            if (get(SAI_OBJECT_TYPE_VLAN, vlanOid, 1, &attr) == SAI_STATUS_SUCCESS)
+            {
+                if (attr.value.u16 == kv.first.bd_id)
+                {
+                    bv_id = vlanOid;
+                    break;
+                }
+            }
+        }
+
+        if (bv_id == SAI_NULL_OBJECT_ID || portId == SAI_NULL_OBJECT_ID)
+        {
+            SWSS_LOG_DEBUG("vppPollFdb: cannot resolve aged MAC bd=%u, skipping event", kv.first.bd_id);
+            continue;
+        }
+
+        FdbInfo fi;
+        fi.setPortId(portId);
+        fi.setVlanId((sai_vlan_id_t)kv.first.bd_id);
+        fi.m_bridgePortId = bpId;
+        fi.m_fdbEntry.switch_id = m_switch_id;
+        fi.m_fdbEntry.bv_id = bv_id;
+        memcpy(fi.m_fdbEntry.mac_address, kv.first.mac, sizeof(sai_mac_t));
+
+        auto sit = m_fdb_info_set.find(fi);
+        if (sit != m_fdb_info_set.end())
+        {
+            m_fdb_info_set.erase(sit);
+        }
+
+        SWSS_LOG_NOTICE("vppPollFdb: AGED mac=%02x:%02x:%02x:%02x:%02x:%02x bd=%u",
+                kv.first.mac[0], kv.first.mac[1], kv.first.mac[2],
+                kv.first.mac[3], kv.first.mac[4], kv.first.mac[5],
+                kv.first.bd_id);
+
+        processFdbInfo(fi, SAI_FDB_EVENT_AGED);
+    }
+
+    /* Update the cache */
+    m_vpp_fdb_cache = new_fdb;
+}
+
+/*
+ * vppProcessL2MacEvent - Process a VPP L2 MAC learn/age/move event
+ *
+ * Called from the events thread when VPP fires an l2_macs_event callback.
+ * Maps sw_if_index to SAI bridge ports and generates SAI FDB events.
+ *
+ * This is the event-driven path — lower latency than polling. The poll
+ * fallback (vppPollFdb) still runs periodically to catch stragglers.
+ */
+void SwitchVpp::vppProcessL2MacEvent(
+        _In_ const vpp_l2_mac_event_t *event)
+{
+    SWSS_LOG_ENTER();
+
+    if (!event || event->n_macs == 0)
+        return;
+
+    /* Build maps to resolve sw_if_index → bridge port info (same approach as vppPollFdb) */
+    struct BridgePortInfo {
+        sai_object_id_t portId;
+        sai_object_id_t bridgePortId;
+        bool isTunnel;
+        uint16_t vlanId;              /* set for tunnel BPs (from TunnelManager) */
+    };
+
+    std::map<std::string, BridgePortInfo> hwif_to_bp;    /* physical ports/LAGs */
+    std::map<uint32_t, BridgePortInfo>    swif_to_bp;    /* tunnel bridge ports */
+
+    auto bpIt = m_objectHash.find(SAI_OBJECT_TYPE_BRIDGE_PORT);
+    if (bpIt == m_objectHash.end())
+        return;
+
+    auto &bpHash = bpIt->second;
+
+    for (auto &kv : bpHash)
+    {
+        sai_object_id_t bpId;
+        sai_deserialize_object_id(kv.first, bpId);
+
+        sai_attribute_t attr;
+        attr.id = SAI_BRIDGE_PORT_ATTR_TYPE;
+        if (get(SAI_OBJECT_TYPE_BRIDGE_PORT, bpId, 1, &attr) != SAI_STATUS_SUCCESS)
+            continue;
+
+        auto bpType = (sai_bridge_port_type_t)attr.value.s32;
+
+        if (bpType == SAI_BRIDGE_PORT_TYPE_TUNNEL)
+        {
+            attr.id = SAI_BRIDGE_PORT_ATTR_TUNNEL_ID;
+            if (get(SAI_OBJECT_TYPE_BRIDGE_PORT, bpId, 1, &attr) != SAI_STATUS_SUCCESS)
+                continue;
+
+            sai_object_id_t tunnelOid = attr.value.oid;
+            uint32_t sw_if_index = 0;
+            uint16_t vlan_id = 0;
+            if (!m_tunnel_mgr.getL2TunnelInfo(tunnelOid, sw_if_index, vlan_id))
+                continue;
+
+            BridgePortInfo info;
+            info.portId = tunnelOid;
+            info.bridgePortId = bpId;
+            info.isTunnel = true;
+            info.vlanId = vlan_id;
+            swif_to_bp[sw_if_index] = info;
+            continue;
+        }
+
+        attr.id = SAI_BRIDGE_PORT_ATTR_PORT_ID;
+        if (get(SAI_OBJECT_TYPE_BRIDGE_PORT, bpId, 1, &attr) != SAI_STATUS_SUCCESS)
+            continue;
+
+        sai_object_id_t portId = attr.value.oid;
+        std::string hwif;
+        if (!vpp_get_hwif_name(portId, 0, hwif))
+            continue;
+
+        BridgePortInfo info;
+        info.portId = portId;
+        info.bridgePortId = bpId;
+        info.isTunnel = false;
+        info.vlanId = 0;
+        hwif_to_bp[hwif] = info;
+    }
+
+    if (hwif_to_bp.empty() && swif_to_bp.empty())
+        return;
+
+    /* Build VLAN ID → VLAN OID map */
+    std::map<uint16_t, sai_object_id_t> vlanid_to_oid;
+
+    auto vlanIt = m_objectHash.find(SAI_OBJECT_TYPE_VLAN);
+    if (vlanIt != m_objectHash.end())
+    {
+        for (auto &kv : vlanIt->second)
+        {
+            sai_object_id_t vlanOid;
+            sai_deserialize_object_id(kv.first, vlanOid);
+            sai_attribute_t attr;
+            attr.id = SAI_VLAN_ATTR_VLAN_ID;
+            if (get(SAI_OBJECT_TYPE_VLAN, vlanOid, 1, &attr) == SAI_STATUS_SUCCESS)
+            {
+                vlanid_to_oid[attr.value.u16] = vlanOid;
+            }
+        }
+    }
+
+    /* Process each MAC entry in the event */
+    for (uint32_t i = 0; i < event->n_macs; i++)
+    {
+        auto &entry = event->entries[i];
+
+        /* Resolve sw_if_index → bridge port info.
+         * Check tunnel map first (direct sw_if_index), then hwif name map. */
+        const BridgePortInfo *bp_info = nullptr;
+        const char *port_name = nullptr;
+
+        auto swif_it = swif_to_bp.find(entry.sw_if_index);
+        if (swif_it != swif_to_bp.end())
+        {
+            /* Skip tunnel-learned MACs — remote MACs should come via EVPN
+             * control plane (BGP Type-2 → fdbsyncd), not SAI FDB events.
+             * VPP learns them on the data plane for local forwarding only. */
+            SWSS_LOG_DEBUG("vppProcessL2MacEvent: skipping tunnel-learned MAC sw_if_index %u", entry.sw_if_index);
+            continue;
+        }
+        else
+        {
+            const char *hwif = vpp_get_swif_name(entry.sw_if_index);
+            if (!hwif)
+            {
+                SWSS_LOG_DEBUG("vppProcessL2MacEvent: cannot resolve sw_if_index %u", entry.sw_if_index);
+                continue;
+            }
+            port_name = hwif;
+
+            auto bp_it = hwif_to_bp.find(std::string(hwif));
+            if (bp_it == hwif_to_bp.end())
+            {
+                SWSS_LOG_DEBUG("vppProcessL2MacEvent: hwif %s not mapped to bridge port", hwif);
+                continue;
+            }
+            bp_info = &bp_it->second;
+        }
+
+        /* Resolve VLAN for this bridge port.
+         * Tunnel BPs aren't in VLAN_MEMBER — use vlanId from TunnelManager.
+         * Physical port BPs are found via VLAN_MEMBER scan. */
+        sai_object_id_t bv_id = SAI_NULL_OBJECT_ID;
+        sai_vlan_id_t vlan_id = 0;
+
+        if (bp_info->isTunnel && bp_info->vlanId != 0)
+        {
+            vlan_id = bp_info->vlanId;
+            /* Look up VLAN OID from vlanid_to_oid map */
+            auto vit = vlanid_to_oid.find(vlan_id);
+            if (vit != vlanid_to_oid.end())
+                bv_id = vit->second;
+        }
+        else
+        {
+            /* Check VLAN members to find which VLAN this bridge port belongs to */
+            auto vmIt = m_objectHash.find(SAI_OBJECT_TYPE_VLAN_MEMBER);
+            if (vmIt != m_objectHash.end())
+            {
+                for (auto &vmkv : vmIt->second)
+                {
+                    sai_object_id_t vmId;
+                    sai_deserialize_object_id(vmkv.first, vmId);
+
+                    sai_attribute_t attr;
+                    attr.id = SAI_VLAN_MEMBER_ATTR_BRIDGE_PORT_ID;
+                    if (get(SAI_OBJECT_TYPE_VLAN_MEMBER, vmId, 1, &attr) != SAI_STATUS_SUCCESS)
+                        continue;
+
+                    if (attr.value.oid != bp_info->bridgePortId)
+                        continue;
+
+                    /* Found it — get the VLAN */
+                    attr.id = SAI_VLAN_MEMBER_ATTR_VLAN_ID;
+                    if (get(SAI_OBJECT_TYPE_VLAN_MEMBER, vmId, 1, &attr) == SAI_STATUS_SUCCESS)
+                    {
+                        sai_object_id_t vlanOid = attr.value.oid;
+                        sai_attribute_t vattr;
+                        vattr.id = SAI_VLAN_ATTR_VLAN_ID;
+                        if (get(SAI_OBJECT_TYPE_VLAN, vlanOid, 1, &vattr) == SAI_STATUS_SUCCESS)
+                        {
+                            vlan_id = vattr.value.u16;
+                            bv_id = vlanOid;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (bv_id == SAI_NULL_OBJECT_ID)
+        {
+            SWSS_LOG_DEBUG("vppProcessL2MacEvent: cannot find VLAN for bridge port %s",
+                    sai_serialize_object_id(bp_info->bridgePortId).c_str());
+            continue;
+        }
+
+        /* Map VPP action to SAI FDB event */
+        sai_fdb_event_t fdb_event;
+        switch (entry.action)
+        {
+            case VPP_L2_MAC_EVENT_ACTION_ADD:
+            case VPP_L2_MAC_EVENT_ACTION_MOVE:
+                fdb_event = SAI_FDB_EVENT_LEARNED;
+                break;
+            case VPP_L2_MAC_EVENT_ACTION_DELETE:
+                fdb_event = SAI_FDB_EVENT_AGED;
+                break;
+            default:
+                SWSS_LOG_WARN("vppProcessL2MacEvent: unknown action %u", entry.action);
+                continue;
+        }
+
+        /* Build FdbInfo and generate event */
+        FdbInfo fi;
+        fi.setPortId(bp_info->portId);
+        fi.setVlanId(vlan_id);
+        fi.m_bridgePortId = bp_info->bridgePortId;
+        fi.m_fdbEntry.switch_id = m_switch_id;
+        fi.m_fdbEntry.bv_id = bv_id;
+        memcpy(fi.m_fdbEntry.mac_address, entry.mac, sizeof(sai_mac_t));
+        fi.setTimestamp((uint32_t)time(NULL));
+
+        if (fdb_event == SAI_FDB_EVENT_LEARNED)
+        {
+            m_fdb_info_set.insert(fi);
+        }
+        else if (fdb_event == SAI_FDB_EVENT_AGED)
+        {
+            auto sit = m_fdb_info_set.find(fi);
+            if (sit != m_fdb_info_set.end())
+                m_fdb_info_set.erase(sit);
+        }
+
+        /* Also update the poll cache so polling doesn't re-fire */
+        VppFdbKey key;
+        key.bd_id = vlan_id; /* BD ID == VLAN ID in our mapping */
+        memcpy(key.mac, entry.mac, 6);
+
+        if (fdb_event == SAI_FDB_EVENT_LEARNED)
+        {
+            VppFdbValue val;
+            val.sw_if_index = entry.sw_if_index;
+            val.static_mac = false;
+            val.bvi_mac = false;
+            m_vpp_fdb_cache[key] = val;
+        }
+        else
+        {
+            m_vpp_fdb_cache.erase(key);
+        }
+
+        SWSS_LOG_NOTICE("vppProcessL2MacEvent: %s mac=%02x:%02x:%02x:%02x:%02x:%02x "
+                "vlan=%u port=%s action=%u",
+                (fdb_event == SAI_FDB_EVENT_LEARNED) ? "LEARNED" : "AGED",
+                entry.mac[0], entry.mac[1], entry.mac[2],
+                entry.mac[3], entry.mac[4], entry.mac[5],
+                vlan_id, port_name, entry.action);
+
+        processFdbInfo(fi, fdb_event);
+    }
 }
