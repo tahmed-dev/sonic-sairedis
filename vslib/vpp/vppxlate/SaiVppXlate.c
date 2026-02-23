@@ -912,6 +912,17 @@ vl_api_bridge_flags_reply_t_handler (vl_api_bridge_flags_reply_t *msg)
 }
 
 static void
+vl_api_l2_flags_reply_t_handler (vl_api_l2_flags_reply_t *msg)
+{
+    int retval = (int)ntohl((uint32_t)msg->retval);
+    set_reply_status(retval);
+
+    SAIVPP_WARN("l2 flags reply handler  %s(%d) resulting_bitmap=0x%x",
+        retval ? "failed" : "successful", retval,
+        ntohl(msg->resulting_feature_bitmap));
+}
+
+static void
 vl_api_l2fib_add_del_reply_t_handler (vl_api_l2fib_add_del_reply_t *msg)
 {
     int retval = (int)ntohl((uint32_t)msg->retval);
@@ -951,6 +962,42 @@ vl_api_l2fib_flush_bd_reply_t_handler (vl_api_l2fib_flush_bd_reply_t *msg)
     SAIVPP_DEBUG("l2fib flush bd reply handler  %s(%d)", retval ? "failed" : "successful", retval);
     //SAIVPP_ERROR("l2fib flush bd reply handler %s(%d)",retval ? "failed" : "successful", retval);
 
+}
+
+static void
+vl_api_l2_fib_table_details_t_handler (vl_api_l2_fib_table_details_t *mp)
+{
+    if (!mp->context) {
+        return;
+    }
+
+    vpp_l2fib_dump_result_t *result = (vpp_l2fib_dump_result_t *) get_index_ptr(mp->context);
+    if (!result) {
+        return;
+    }
+
+    if (result->count >= VPP_L2FIB_MAX_ENTRIES) {
+        SAIVPP_WARN("l2fib dump: max entries reached (%d)", VPP_L2FIB_MAX_ENTRIES);
+        return;
+    }
+
+    uint32_t idx = result->count;
+    result->entries[idx].bd_id = ntohl(mp->bd_id);
+    memcpy(result->entries[idx].mac, mp->mac, 6);
+    result->entries[idx].sw_if_index = ntohl(mp->sw_if_index);
+    result->entries[idx].static_mac = mp->static_mac;
+    result->entries[idx].filter_mac = mp->filter_mac;
+    result->entries[idx].bvi_mac = mp->bvi_mac;
+    result->count++;
+}
+
+static void
+vl_api_bd_ip_mac_add_del_reply_t_handler (vl_api_bd_ip_mac_add_del_reply_t *msg)
+{
+    int retval = (int)ntohl((uint32_t)msg->retval);
+    set_reply_status(retval);
+
+    SAIVPP_DEBUG("bd_ip_mac_add_del reply handler %s(%d)", retval ? "failed" : "successful", retval);
 }
 
 static void
@@ -1028,6 +1075,59 @@ vl_api_bfd_udp_session_event_t_handler (vl_api_bfd_udp_session_event_t *msg)
     SAIVPP_DEBUG("BFD udp session event, multihop: %d, sw_if_index: %d, "
                  "state: %d ",
                  multihop, htonl(msg->sw_if_index), htonl(msg->state));
+}
+
+static void
+vl_api_l2_macs_event_t_handler (vl_api_l2_macs_event_t *mp)
+{
+    uint32_t n_macs = ntohl(mp->n_macs);
+
+    if (n_macs == 0) {
+        return;
+    }
+
+    SAIVPP_WARN("L2 MAC event received: %u MACs", n_macs);
+
+    /* Cap to our max buffer size */
+    if (n_macs > VPP_L2_MAC_EVENT_MAX_MACS) {
+        n_macs = VPP_L2_MAC_EVENT_MAX_MACS;
+    }
+
+    vpp_event_info_t *evinfo;
+    evinfo = calloc(1, sizeof(*evinfo));
+    if (!evinfo) {
+        SAIVPP_ERROR("L2 MAC event: failed to allocate event info");
+        return;
+    }
+
+    evinfo->type = VPP_L2_MAC_EVENT;
+    vpp_l2_mac_event_t *ev = &evinfo->data.l2_mac_event;
+    ev->n_macs = n_macs;
+
+    for (uint32_t i = 0; i < n_macs; i++) {
+        ev->entries[i].sw_if_index = ntohl(mp->mac[i].sw_if_index);
+        memcpy(ev->entries[i].mac, mp->mac[i].mac_addr, 6);
+        ev->entries[i].action = mp->mac[i].action;
+        ev->entries[i].flags = mp->mac[i].flags;
+
+        SAIVPP_WARN("  MAC[%u]: %02x:%02x:%02x:%02x:%02x:%02x sw_if=%u action=%u",
+                    i,
+                    ev->entries[i].mac[0], ev->entries[i].mac[1],
+                    ev->entries[i].mac[2], ev->entries[i].mac[3],
+                    ev->entries[i].mac[4], ev->entries[i].mac[5],
+                    ev->entries[i].sw_if_index, ev->entries[i].action);
+    }
+
+    vpp_ev_enqueue(evinfo);
+}
+
+static void
+vl_api_want_l2_macs_events2_reply_t_handler (vl_api_want_l2_macs_events2_reply_t *msg)
+{
+    int retval = (int)ntohl((uint32_t)msg->retval);
+    set_reply_status(retval);
+
+    SAIVPP_DEBUG("l2 macs events enable %s(%d)", retval ? "failed" : "successful", retval);
 }
 
 static void
@@ -1262,6 +1362,7 @@ static void vpp_base_vpe_init(void)
     _(L2_MSG_ID(BVI_CREATE_REPLY), bvi_create_reply) \
     _(L2_MSG_ID(BVI_DELETE_REPLY), bvi_delete_reply) \
     _(L2_MSG_ID(BRIDGE_FLAGS_REPLY), bridge_flags_reply) \
+    _(L2_MSG_ID(L2_FLAGS_REPLY), l2_flags_reply) \
     _(BOND_MSG_ID(BOND_CREATE_REPLY), bond_create_reply) \
     _(BOND_MSG_ID(BOND_DELETE_REPLY), bond_delete_reply) \
     _(BOND_MSG_ID(BOND_ADD_MEMBER_REPLY), bond_add_member_reply) \
@@ -1270,6 +1371,10 @@ static void vpp_base_vpe_init(void)
     _(L2_MSG_ID(L2FIB_FLUSH_ALL_REPLY), l2fib_flush_all_reply) \
     _(L2_MSG_ID(L2FIB_FLUSH_INT_REPLY), l2fib_flush_int_reply) \
     _(L2_MSG_ID(L2FIB_FLUSH_BD_REPLY), l2fib_flush_bd_reply) \
+    _(L2_MSG_ID(L2_FIB_TABLE_DETAILS), l2_fib_table_details) \
+    _(L2_MSG_ID(L2_MACS_EVENT), l2_macs_event) \
+    _(L2_MSG_ID(WANT_L2_MACS_EVENTS2_REPLY), want_l2_macs_events2_reply) \
+    _(L2_MSG_ID(BD_IP_MAC_ADD_DEL_REPLY), bd_ip_mac_add_del_reply) \
     _(BFD_MSG_ID(BFD_UDP_ADD_REPLY), bfd_udp_add_reply) \
     _(BFD_MSG_ID(BFD_UDP_DEL_REPLY), bfd_udp_del_reply) \
     _(BFD_MSG_ID(BFD_UDP_SESSION_EVENT), bfd_udp_session_event) \
@@ -1792,6 +1897,9 @@ int init_vpp_client()
 
         /* Enable BFD multihop support in VPP */
         vpp_bfd_udp_enable_multihop();
+
+        /* Register for L2 MAC learn/age/move events from VPP l2fib */
+        l2_macs_events_enable_disable(true, 10);
 
         vpp_evq_init();
         vpp_client_init = 1;
@@ -2876,9 +2984,13 @@ int vpp_bridge_domain_add_del(uint32_t bridge_id, bool is_add)
 }
 int set_sw_interface_l2_bridge_by_index(uint32_t sw_if_index, uint32_t bridge_id, bool l2_mode, uint32_t port_type)
 {
+    return set_sw_interface_l2_bridge_by_index_with_shg(sw_if_index, bridge_id, l2_mode, port_type, 0);
+}
+
+int set_sw_interface_l2_bridge_by_index_with_shg(uint32_t sw_if_index, uint32_t bridge_id, bool l2_mode, uint32_t port_type, uint32_t shg)
+{
     vat_main_t *vam = &vat_main;
     vl_api_sw_interface_set_l2_bridge_t *mp;
-    u32 shg = 0;
     int ret;
 
     VPP_LOCK();
@@ -2911,6 +3023,11 @@ int set_sw_interface_l2_bridge_by_index(uint32_t sw_if_index, uint32_t bridge_id
 
 int set_sw_interface_l2_bridge(const char *hwif_name, uint32_t bridge_id, bool l2_mode, uint32_t port_type)
 {
+    return set_sw_interface_l2_bridge_with_shg(hwif_name, bridge_id, l2_mode, port_type, 0);
+}
+
+int set_sw_interface_l2_bridge_with_shg(const char *hwif_name, uint32_t bridge_id, bool l2_mode, uint32_t port_type, uint32_t shg)
+{
     vat_main_t *vam = &vat_main;
 
     if (hwif_name) {
@@ -2918,7 +3035,7 @@ int set_sw_interface_l2_bridge(const char *hwif_name, uint32_t bridge_id, bool l
 
         idx = get_swif_idx(vam, hwif_name);
         if (idx != (u32) -1) {
-            return set_sw_interface_l2_bridge_by_index(idx, bridge_id, l2_mode, port_type);
+            return set_sw_interface_l2_bridge_by_index_with_shg(idx, bridge_id, l2_mode, port_type, shg);
         } else {
             SAIVPP_ERROR("Unable to get sw_index for %s\n", hwif_name);
             return -EINVAL;
@@ -3089,6 +3206,73 @@ int set_bridge_domain_flags(uint32_t bd_id, vpp_bd_flags_t flag, bool enable)
     mp->bd_id = htonl(bd_id);
     mp->is_set = enable;
     mp->flags = htonl(flag);
+    S (mp);
+
+    W (ret);
+
+    VPP_UNLOCK();
+
+    return ret;
+}
+
+int set_l2_interface_flags(uint32_t sw_if_index, uint32_t feature_bitmap, bool is_set)
+{
+    vat_main_t *vam = &vat_main;
+    vl_api_l2_flags_t *mp;
+    int ret;
+
+    SAIVPP_WARN("Setting L2 interface flags: sw_if_index=%u bitmap=0x%x is_set=%d\n",
+        sw_if_index, feature_bitmap, is_set);
+    VPP_LOCK();
+
+    __plugin_msg_base = l2_msg_id_base;
+
+    M (L2_FLAGS, mp);
+
+    mp->sw_if_index = htonl(sw_if_index);
+    mp->is_set = is_set;
+    mp->feature_bitmap = htonl(feature_bitmap);
+
+    S (mp);
+
+    W (ret);
+
+    VPP_UNLOCK();
+
+    return ret;
+}
+
+int bd_ip_mac_add_del(uint32_t bd_id, int af,
+		      const void *ip_addr, size_t ip_len,
+		      const uint8_t *mac, bool is_add)
+{
+    vat_main_t *vam = &vat_main;
+    vl_api_bd_ip_mac_add_del_t *mp;
+    int ret;
+
+    SAIVPP_WARN("bd_ip_mac_add_del bd:%d is_add:%d\n", bd_id, is_add);
+    VPP_LOCK();
+
+    __plugin_msg_base = l2_msg_id_base;
+
+    M (BD_IP_MAC_ADD_DEL, mp);
+
+    mp->is_add = is_add;
+    mp->entry.bd_id = htonl(bd_id);
+
+    if (af == AF_INET) {
+        mp->entry.ip.af = ADDRESS_IP4;
+        memcpy(mp->entry.ip.un.ip4, ip_addr, sizeof(mp->entry.ip.un.ip4));
+    } else if (af == AF_INET6) {
+        mp->entry.ip.af = ADDRESS_IP6;
+        memcpy(mp->entry.ip.un.ip6, ip_addr, sizeof(mp->entry.ip.un.ip6));
+    } else {
+        VPP_UNLOCK();
+        return -EINVAL;
+    }
+
+    memcpy(mp->entry.mac, mac, sizeof(mp->entry.mac));
+
     S (mp);
 
     W (ret);
@@ -3332,6 +3516,69 @@ int l2fib_flush_bd(uint32_t bd_id)
     WR (ret);
 
     VPP_UNLOCK();
+
+    return ret;
+}
+
+int l2fib_table_dump(uint32_t bd_id, vpp_l2fib_dump_result_t *result)
+{
+    vat_main_t *vam = &vat_main;
+    vl_api_l2_fib_table_dump_t *mp;
+    vl_api_control_ping_t *mp_ping;
+    int ret;
+
+    if (!result) {
+        return -EINVAL;
+    }
+
+    result->count = 0;
+
+    VPP_LOCK();
+
+    __plugin_msg_base = l2_msg_id_base;
+
+    M (L2_FIB_TABLE_DUMP, mp);
+
+    mp->bd_id = htonl(bd_id);
+    mp->context = store_ptr(result);
+
+    S (mp);
+
+    /* Use a control ping for synchronization */
+    __plugin_msg_base = memclnt_msg_id_base;
+
+    PING (NULL, mp_ping);
+    S (mp_ping);
+
+    W (ret);
+
+    VPP_UNLOCK();
+
+    return ret;
+}
+
+int l2_macs_events_enable_disable(bool enable, uint8_t max_macs_in_event)
+{
+    vat_main_t *vam = &vat_main;
+    vl_api_want_l2_macs_events2_t *mp;
+    int ret;
+
+    VPP_LOCK();
+
+    __plugin_msg_base = l2_msg_id_base;
+
+    M (WANT_L2_MACS_EVENTS2, mp);
+    mp->enable_disable = enable;
+    mp->max_macs_in_event = max_macs_in_event;
+    mp->pid = htonl((uint32_t)getpid());
+
+    S (mp);
+    W (ret);
+
+    VPP_UNLOCK();
+
+    SAIVPP_WARN("l2_macs_events_enable_disable: enable=%d max_macs=%u ret=%d",
+                enable, max_macs_in_event, ret);
 
     return ret;
 }

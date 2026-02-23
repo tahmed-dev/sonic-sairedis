@@ -31,6 +31,80 @@ sai_status_t SwitchVpp::addRemoveIpNbr(
 
     sai_deserialize_neighbor_entry(serializedObjectId, nbr_entry);
 
+    attr.id = SAI_ROUTER_INTERFACE_ATTR_TYPE;
+
+    CHECK_STATUS(get(SAI_OBJECT_TYPE_ROUTER_INTERFACE, nbr_entry.rif_id, 1, &attr));
+
+    int32_t rif_type = attr.value.s32;
+
+    /*
+     * For VLAN-type RIF (BVI), program the bridge domain ARP termination
+     * table via bd_ip_mac_add_del so that VPP can respond to ARP requests
+     * on behalf of hosts in the bridge domain (proxy ARP / ARP termination).
+     */
+    if (rif_type == SAI_ROUTER_INTERFACE_TYPE_VLAN)
+    {
+        attr.id = SAI_ROUTER_INTERFACE_ATTR_VLAN_ID;
+        CHECK_STATUS(get(SAI_OBJECT_TYPE_ROUTER_INTERFACE, nbr_entry.rif_id, 1, &attr));
+
+        sai_object_id_t vlan_oid = attr.value.oid;
+
+        attr.id = SAI_VLAN_ATTR_VLAN_ID;
+        CHECK_STATUS(get(SAI_OBJECT_TYPE_VLAN, vlan_oid, 1, &attr));
+
+        uint32_t bd_id = (uint32_t)attr.value.u16;
+
+        sai_mac_t nbr_mac;
+        bool no_mac = true;
+
+        if (is_add)
+        {
+            for (uint32_t i = 0; i < attr_count; i++)
+            {
+                if (attr_list[i].id == SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS)
+                {
+                    memcpy(nbr_mac, attr_list[i].value.mac, sizeof(sai_mac_t));
+                    no_mac = false;
+                    break;
+                }
+            }
+        } else {
+            attr.id = SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS;
+            if (get(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, serializedObjectId, 1, &attr) == SAI_STATUS_SUCCESS) {
+                memcpy(nbr_mac, attr.value.mac, sizeof(sai_mac_t));
+                no_mac = false;
+            }
+        }
+
+        if (no_mac)
+        {
+            SWSS_LOG_ERROR("No mac for BD ARP term neighbor %s", serializedObjectId.c_str());
+            return SAI_STATUS_FAILURE;
+        }
+
+        init_vpp_client();
+
+        switch (nbr_entry.ip_address.addr_family) {
+        case SAI_IP_ADDR_FAMILY_IPV4:
+            bd_ip_mac_add_del(bd_id, AF_INET,
+                              &nbr_entry.ip_address.addr.ip4,
+                              sizeof(nbr_entry.ip_address.addr.ip4),
+                              nbr_mac, is_add);
+            break;
+        case SAI_IP_ADDR_FAMILY_IPV6:
+            bd_ip_mac_add_del(bd_id, AF_INET6,
+                              nbr_entry.ip_address.addr.ip6,
+                              sizeof(nbr_entry.ip_address.addr.ip6),
+                              nbr_mac, is_add);
+            break;
+        }
+
+        SWSS_LOG_NOTICE("BD %d ARP term %s for neighbor %s", bd_id,
+                         is_add ? "add" : "del", serializedObjectId.c_str());
+
+        return SAI_STATUS_SUCCESS;
+    }
+
     attr.id = SAI_ROUTER_INTERFACE_ATTR_PORT_ID;
 
     CHECK_STATUS(get(SAI_OBJECT_TYPE_ROUTER_INTERFACE, nbr_entry.rif_id, 1, &attr));
@@ -41,19 +115,16 @@ sai_status_t SwitchVpp::addRemoveIpNbr(
     }
     auto port_oid = attr.value.oid;
 
-    attr.id = SAI_ROUTER_INTERFACE_ATTR_TYPE;
-
-    CHECK_STATUS(get(SAI_OBJECT_TYPE_ROUTER_INTERFACE, nbr_entry.rif_id, 1, &attr));
-    if (attr.value.s32 != SAI_ROUTER_INTERFACE_TYPE_SUB_PORT &&
-        attr.value.s32 != SAI_ROUTER_INTERFACE_TYPE_PORT)
+    if (rif_type != SAI_ROUTER_INTERFACE_TYPE_SUB_PORT &&
+        rif_type != SAI_ROUTER_INTERFACE_TYPE_PORT)
     {
-        SWSS_LOG_NOTICE("Skipping neighbor add for attr type %d", attr.value.s32);
+        SWSS_LOG_NOTICE("Skipping neighbor add for attr type %d", rif_type);
 
         return SAI_STATUS_SUCCESS;
     }
 
     uint16_t vlan_id = 0;
-    if (attr.value.s32 == SAI_ROUTER_INTERFACE_TYPE_SUB_PORT)
+    if (rif_type == SAI_ROUTER_INTERFACE_TYPE_SUB_PORT)
     {
         attr.id = SAI_ROUTER_INTERFACE_ATTR_OUTER_VLAN_ID;
 

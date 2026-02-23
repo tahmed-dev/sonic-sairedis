@@ -956,6 +956,20 @@ sai_status_t SwitchVpp::create(
        return createLagMember(object_id, switch_id, attr_count, attr_list);
     }
 
+    if (object_type == SAI_OBJECT_TYPE_TUNNEL)
+    {
+        sai_object_id_t object_id;
+        sai_deserialize_object_id(serializedObjectId, object_id);
+
+        CHECK_STATUS(create_internal(object_type, serializedObjectId, switch_id, attr_count, attr_list));
+
+        uint32_t sw_if_index;
+        sai_status_t status = m_tunnel_mgr.create_l2_vxlan_tunnel(object_id, sw_if_index);
+        SWSS_LOG_INFO("L2 VXLAN tunnel create for %s: status=%d sw_if_index=%u",
+            serializedObjectId.c_str(), status, sw_if_index);
+        return status;
+    }
+
     return create_internal(object_type, serializedObjectId, switch_id, attr_count, attr_list);
 }
 
@@ -1190,6 +1204,20 @@ sai_status_t SwitchVpp::remove(
         return bfd_session_del(serializedObjectId);
     }
 
+    if (object_type == SAI_OBJECT_TYPE_TUNNEL)
+    {
+        sai_object_id_t object_id;
+        sai_deserialize_object_id(serializedObjectId, object_id);
+
+        sai_status_t status = m_tunnel_mgr.remove_l2_vxlan_tunnel(object_id);
+        if (status != SAI_STATUS_SUCCESS) {
+            SWSS_LOG_ERROR("Failed to remove L2 VXLAN tunnel resources"); 
+        }
+        
+        // still need to clean up internal SAI state
+        return remove_internal(object_type, serializedObjectId);
+    }
+
     return remove_internal(object_type, serializedObjectId);
 }
 
@@ -1410,6 +1438,43 @@ sai_status_t SwitchVpp::set_internal(
 
     // set have only one attribute
     attrHash[a->getAttrMetadata()->attridname] = a;
+
+    /*
+     * When proxy_arp is enabled on a VLAN interface, intfsorch sets the
+     * broadcast/multicast flood control type to NONE.  In VPP, this maps
+     * to enabling arp-ufwd on the bridge domain so that ARP requests for
+     * unknown IPs are forwarded (flooded/punted) instead of silently dropped
+     * by ARP termination.
+     */
+    if (objectType == SAI_OBJECT_TYPE_VLAN &&
+        (attr->id == SAI_VLAN_ATTR_BROADCAST_FLOOD_CONTROL_TYPE ||
+         attr->id == SAI_VLAN_ATTR_UNKNOWN_MULTICAST_FLOOD_CONTROL_TYPE))
+    {
+        /* Resolve VLAN ID from object hash */
+        auto md_vlan_id = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_VLAN, SAI_VLAN_ATTR_VLAN_ID);
+        auto vlan_id_it = attrHash.find(md_vlan_id->attridname);
+        if (vlan_id_it != attrHash.end())
+        {
+            uint32_t vlan_id = (uint32_t)vlan_id_it->second->getAttr()->value.u16;
+
+            /*
+             * Do NOT enable arp-ufwd.  The l2-uu-fwd node requires a valid
+             * uu_fwd_sw_if_index on the BD, which is never programmed in our
+             * EVPN MH topology (UU-Flood mode is "flood", not a specific
+             * interface).  When arp-ufwd is on and the UU index is ~0,
+             * l2-output receives sw_if_index=-1 and drops every BUM frame
+             * silently.  With arp-ufwd off, ARP broadcasts take the normal
+             * l2-flood path which works correctly.
+             *
+             * arp-term (set separately in SwitchVppFdb.cpp) still intercepts
+             * and proxy-replies to ARPs whose target IP is in the BD's
+             * arp-term table — no flooding required for those.
+             */
+            SWSS_LOG_NOTICE("VLAN %u: skipping arp-ufwd (flood_control=%d) — "
+                            "no UU forward interface configured",
+                            vlan_id, attr->value.s32);
+        }
+    }
 
     return SAI_STATUS_SUCCESS;
 }
