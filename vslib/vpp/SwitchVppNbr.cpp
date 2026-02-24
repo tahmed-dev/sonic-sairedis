@@ -41,9 +41,29 @@ sai_status_t SwitchVpp::addRemoveIpNbr(
      * For VLAN-type RIF (BVI), program the bridge domain ARP termination
      * table via bd_ip_mac_add_del so that VPP can respond to ARP requests
      * on behalf of hosts in the bridge domain (proxy ARP / ARP termination).
+     *
+     * On a real ASIC, ARP termination entries persist in hardware until
+     * explicitly cleared by the control plane.  In the VPP data path the
+     * Vlan SVI has no IPv4 address (it lives on the BVI tap instead), so
+     * the kernel neighbor for static NEIGH entries transitions to FAILED
+     * and neighsyncd issues a SAI remove.  Honoring that remove would
+     * leave the bridge domain without proxy-ARP coverage, breaking
+     * overlay connectivity.
+     *
+     * To match real ASIC behavior we only program arp-term on *add* and
+     * silently accept (but ignore) the remove — the entry stays in VPP's
+     * BD ip-mac table until the BD itself is destroyed.
      */
     if (rif_type == SAI_ROUTER_INTERFACE_TYPE_VLAN)
     {
+        if (!is_add)
+        {
+            SWSS_LOG_NOTICE("Keeping BD ARP term entry for neighbor %s "
+                            "(ignoring remove to match ASIC behavior)",
+                            serializedObjectId.c_str());
+            return SAI_STATUS_SUCCESS;
+        }
+
         attr.id = SAI_ROUTER_INTERFACE_ATTR_VLAN_ID;
         CHECK_STATUS(get(SAI_OBJECT_TYPE_ROUTER_INTERFACE, nbr_entry.rif_id, 1, &attr));
 
@@ -57,22 +77,13 @@ sai_status_t SwitchVpp::addRemoveIpNbr(
         sai_mac_t nbr_mac;
         bool no_mac = true;
 
-        if (is_add)
+        for (uint32_t i = 0; i < attr_count; i++)
         {
-            for (uint32_t i = 0; i < attr_count; i++)
+            if (attr_list[i].id == SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS)
             {
-                if (attr_list[i].id == SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS)
-                {
-                    memcpy(nbr_mac, attr_list[i].value.mac, sizeof(sai_mac_t));
-                    no_mac = false;
-                    break;
-                }
-            }
-        } else {
-            attr.id = SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS;
-            if (get(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, serializedObjectId, 1, &attr) == SAI_STATUS_SUCCESS) {
-                memcpy(nbr_mac, attr.value.mac, sizeof(sai_mac_t));
+                memcpy(nbr_mac, attr_list[i].value.mac, sizeof(sai_mac_t));
                 no_mac = false;
+                break;
             }
         }
 
@@ -89,18 +100,18 @@ sai_status_t SwitchVpp::addRemoveIpNbr(
             bd_ip_mac_add_del(bd_id, AF_INET,
                               &nbr_entry.ip_address.addr.ip4,
                               sizeof(nbr_entry.ip_address.addr.ip4),
-                              nbr_mac, is_add);
+                              nbr_mac, true);
             break;
         case SAI_IP_ADDR_FAMILY_IPV6:
             bd_ip_mac_add_del(bd_id, AF_INET6,
                               nbr_entry.ip_address.addr.ip6,
                               sizeof(nbr_entry.ip_address.addr.ip6),
-                              nbr_mac, is_add);
+                              nbr_mac, true);
             break;
         }
 
-        SWSS_LOG_NOTICE("BD %d ARP term %s for neighbor %s", bd_id,
-                         is_add ? "add" : "del", serializedObjectId.c_str());
+        SWSS_LOG_NOTICE("BD %d ARP term add for neighbor %s", bd_id,
+                         serializedObjectId.c_str());
 
         return SAI_STATUS_SUCCESS;
     }

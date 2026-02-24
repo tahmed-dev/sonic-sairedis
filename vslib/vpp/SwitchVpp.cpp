@@ -1,8 +1,10 @@
 #include "SwitchVpp.h"
 
+#include <sstream>
 #include "meta/sai_serialize.h"
 
 #include "swss/logger.h"
+#include "swss/exec.h"
 
 #include "vppxlate/SaiIntfStats.h"
 
@@ -963,10 +965,123 @@ sai_status_t SwitchVpp::create(
 
         CHECK_STATUS(create_internal(object_type, serializedObjectId, switch_id, attr_count, attr_list));
 
+        // Try L3 VxLAN tunnel (VNI→VRF mapper) first, then L2 (VNI→VLAN)
+        // Both may coexist on the same tunnel object for dual-mode failover.
+        bool l3_attempted = false;
+        {
+            // Check for VNI_TO_VIRTUAL_ROUTER_ID decap mappers → L3 tunnel
+            auto tunnel_obj = get_sai_object(SAI_OBJECT_TYPE_TUNNEL,
+                serializedObjectId);
+            if (tunnel_obj) {
+                sai_attribute_t tattr;
+                tattr.id = SAI_TUNNEL_ATTR_ENCAP_DST_IP;
+                // Only P2P tunnels (with dst IP) get L3 treatment
+                if (tunnel_obj->get_attr(tattr) == SAI_STATUS_SUCCESS) {
+                    sai_ip_address_t dst_ip = tattr.value.ipaddr;
+
+                    tattr.id = SAI_TUNNEL_ATTR_ENCAP_SRC_IP;
+                    if (tunnel_obj->get_attr(tattr) == SAI_STATUS_SUCCESS) {
+                        sai_ip_address_t src_ip = tattr.value.ipaddr;
+
+                        auto decap_mappers = tunnel_obj->get_linked_objects(
+                            SAI_OBJECT_TYPE_TUNNEL_MAP, SAI_TUNNEL_ATTR_DECAP_MAPPERS);
+
+                        for (auto mapper : decap_mappers) {
+                            tattr.id = SAI_TUNNEL_MAP_ATTR_TYPE;
+                            if (mapper->get_attr(tattr) != SAI_STATUS_SUCCESS) continue;
+                            if (tattr.value.s32 != SAI_TUNNEL_MAP_TYPE_VNI_TO_VIRTUAL_ROUTER_ID) continue;
+
+                            auto entries = mapper->get_child_objs(SAI_OBJECT_TYPE_TUNNEL_MAP_ENTRY);
+                            if (!entries) continue;
+
+                            for (auto& entry_pair : *entries) {
+                                auto entry = entry_pair.second;
+                                uint32_t vni = 0;
+                                sai_object_id_t vr_oid = SAI_NULL_OBJECT_ID;
+
+                                tattr.id = SAI_TUNNEL_MAP_ENTRY_ATTR_VNI_ID_KEY;
+                                if (entry->get_attr(tattr) == SAI_STATUS_SUCCESS)
+                                    vni = tattr.value.u32;
+
+                                tattr.id = SAI_TUNNEL_MAP_ENTRY_ATTR_VIRTUAL_ROUTER_ID_VALUE;
+                                if (entry->get_attr(tattr) == SAI_STATUS_SUCCESS)
+                                    vr_oid = tattr.value.oid;
+
+                                if (vni == 0 || vr_oid == SAI_NULL_OBJECT_ID) continue;
+
+                                auto ip_vrf = vpp_get_ip_vrf(vr_oid);
+                                if (!ip_vrf) {
+                                    /* VRF not yet in vrf_objMap — create on-demand.
+                                     * This happens when L3 tunnel is created before any RIF
+                                     * referencing this VR (VRF VNI race). Enumerate linux
+                                     * VRF devices and try to find one with a valid table ID. */
+                                    SWSS_LOG_NOTICE("L3 tunnel: VRF not in map for VR %s, creating on-demand",
+                                        sai_serialize_object_id(vr_oid).c_str());
+
+                                    /* Enumerate linux VRFs: `ip -j link show type vrf` */
+                                    std::string res;
+                                    uint32_t vrf_id = 0;
+                                    std::string cmd = "ip -o link show type vrf | awk -F': ' '{print $2}'";
+                                    if (swss::exec(cmd, res) == 0 && !res.empty()) {
+                                        std::istringstream iss(res);
+                                        std::string vrf_name;
+                                        while (std::getline(iss, vrf_name)) {
+                                            if (vrf_name.empty()) continue;
+                                            /* VRF master device uses 'vrf table N', not 'vrf_slave table N'.
+                                             * vpp_get_vrf_id() only parses vrf_slave, so extract directly. */
+                                            std::string tbl_res;
+                                            std::string tbl_cmd = "ip -d link show dev " + vrf_name +
+                                                " | grep -oP 'vrf table \\K[0-9]+'";
+                                            if (swss::exec(tbl_cmd, tbl_res) == 0 && !tbl_res.empty()) {
+                                                uint32_t tid = (uint32_t)std::stoul(tbl_res);
+                                                if (tid != 0) {
+                                                    vrf_id = tid;
+                                                    SWSS_LOG_NOTICE("L3 tunnel: found linux VRF '%s' table %u for VR %s",
+                                                        vrf_name.c_str(), vrf_id,
+                                                        sai_serialize_object_id(vr_oid).c_str());
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if (vrf_id != 0) {
+                                        vpp_add_ip_vrf(vr_oid, vrf_id);
+                                        ip_vrf = vpp_get_ip_vrf(vr_oid);
+                                    }
+
+                                    if (!ip_vrf) {
+                                        SWSS_LOG_ERROR("L3 tunnel: VRF creation failed for VR %s",
+                                            sai_serialize_object_id(vr_oid).c_str());
+                                        continue;
+                                    }
+                                }
+
+                                sai_status_t l3_status = m_tunnel_mgr.create_l3_vxlan_tunnel(
+                                    object_id, vni, ip_vrf->m_vrf_id, src_ip, dst_ip);
+                                if (l3_status == SAI_STATUS_SUCCESS) {
+                                    l3_attempted = true;
+                                    SWSS_LOG_NOTICE("L3 VxLAN tunnel created for VNI=%u VRF=%u",
+                                        vni, ip_vrf->m_vrf_id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Always try L2 path as well (dual-mode: both L2 and L3 can coexist)
         uint32_t sw_if_index;
         sai_status_t status = m_tunnel_mgr.create_l2_vxlan_tunnel(object_id, sw_if_index);
         SWSS_LOG_INFO("L2 VXLAN tunnel create for %s: status=%d sw_if_index=%u",
             serializedObjectId.c_str(), status, sw_if_index);
+
+        // If L3 succeeded but L2 failed (e.g. no VLAN mapper), that's OK
+        if (l3_attempted && status != SAI_STATUS_SUCCESS) {
+            SWSS_LOG_NOTICE("L2 tunnel path failed but L3 path succeeded, continuing");
+            return SAI_STATUS_SUCCESS;
+        }
         return status;
     }
 
@@ -1209,6 +1324,13 @@ sai_status_t SwitchVpp::remove(
         sai_object_id_t object_id;
         sai_deserialize_object_id(serializedObjectId, object_id);
 
+        // Remove L3 tunnel if present
+        sai_status_t l3_status = m_tunnel_mgr.remove_l3_vxlan_tunnel(object_id);
+        if (l3_status != SAI_STATUS_SUCCESS) {
+            SWSS_LOG_ERROR("Failed to remove L3 VXLAN tunnel resources");
+        }
+
+        // Remove L2 tunnel if present
         sai_status_t status = m_tunnel_mgr.remove_l2_vxlan_tunnel(object_id);
         if (status != SAI_STATUS_SUCCESS) {
             SWSS_LOG_ERROR("Failed to remove L2 VXLAN tunnel resources"); 

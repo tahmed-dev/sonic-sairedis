@@ -3345,6 +3345,134 @@ int vpp_vxlan_tunnel_add_del(vpp_vxlan_tunnel_t *tunnel, bool is_add, u32 *sw_if
     return ret;
 }
 
+int vpp_set_interface_vrf_by_index(uint32_t sw_if_index, uint32_t vrf_id, bool is_ipv6)
+{
+    vat_main_t *vam = &vat_main;
+    return __set_interface_vrf(vam, (vl_api_interface_index_t)sw_if_index, vrf_id, is_ipv6);
+}
+
+int vpp_interface_set_state_by_index(uint32_t sw_if_index, bool is_up)
+{
+    vat_main_t *vam = &vat_main;
+    vl_api_sw_interface_set_flags_t *mp;
+    int ret;
+
+    VPP_LOCK();
+
+    __plugin_msg_base = interface_msg_id_base;
+
+    M (SW_INTERFACE_SET_FLAGS, mp);
+    mp->sw_if_index = htonl(sw_if_index);
+    mp->flags = htonl(is_up ? 1 : 0);
+
+    S (mp);
+
+    WR (ret);
+
+    VPP_UNLOCK();
+
+    return ret;
+}
+
+/*
+ * Create an L3 VxLAN tunnel: create tunnel, bind to VRF, set admin UP.
+ * src_ip/dst_ip are in network byte order (IPv4).
+ */
+int vpp_l3_vxlan_tunnel_add(uint32_t src_ip, uint32_t dst_ip, uint32_t vni,
+                            uint32_t vrf_id, uint32_t *sw_if_index)
+{
+    vpp_vxlan_tunnel_t tun;
+    int ret;
+
+    memset(&tun, 0, sizeof(tun));
+    tun.src_address.sa_family = AF_INET;
+    tun.src_address.addr.ip4.sin_addr.s_addr = src_ip;
+    tun.dst_address.sa_family = AF_INET;
+    tun.dst_address.addr.ip4.sin_addr.s_addr = dst_ip;
+    tun.vni = vni;
+    tun.src_port = 4789;
+    tun.dst_port = 4789;
+    tun.instance = (uint32_t)~0;
+    tun.decap_next_index = (uint32_t)~0;
+    tun.is_l3 = true;
+    tun.encap_vrf_id = 0; /* underlay VRF */
+
+    ret = vpp_vxlan_tunnel_add_del(&tun, true, sw_if_index);
+    if (ret != 0) {
+        SAIVPP_ERROR("L3 VxLAN tunnel create failed: vni=%u ret=%d\n", vni, ret);
+        return ret;
+    }
+
+    /* Handle stale tunnel (sw_if_index=0 means local0) */
+    if (*sw_if_index == 0) {
+        uint32_t dummy = 0;
+        vpp_vxlan_tunnel_add_del(&tun, false, &dummy);
+        ret = vpp_vxlan_tunnel_add_del(&tun, true, sw_if_index);
+        if (ret != 0 || *sw_if_index == 0) {
+            SAIVPP_ERROR("L3 VxLAN tunnel re-create failed: ret=%d idx=%u\n", ret, *sw_if_index);
+            return ret ? ret : -1;
+        }
+    }
+
+    /* Bind tunnel interface to VRF (IPv4) */
+    ret = vpp_set_interface_vrf_by_index(*sw_if_index, vrf_id, false);
+    if (ret != 0) {
+        SAIVPP_ERROR("L3 VxLAN VRF bind (v4) failed: sw_if=%u vrf=%u ret=%d\n",
+                     *sw_if_index, vrf_id, ret);
+        /* rollback tunnel */
+        vpp_vxlan_tunnel_add_del(&tun, false, sw_if_index);
+        return ret;
+    }
+
+    /* Bind tunnel interface to VRF (IPv6) — best-effort, v6 table may not exist */
+    ret = vpp_set_interface_vrf_by_index(*sw_if_index, vrf_id, true);
+    if (ret != 0) {
+        SAIVPP_WARN("L3 VxLAN VRF bind (v6) skipped: sw_if=%u vrf=%u ret=%d (non-fatal)\n",
+                     *sw_if_index, vrf_id, ret);
+        /* Continue — IPv4 is sufficient for EVPN MH L3 failover */
+    }
+
+    /* Set interface admin UP */
+    ret = vpp_interface_set_state_by_index(*sw_if_index, true);
+    if (ret != 0) {
+        SAIVPP_ERROR("L3 VxLAN set UP failed: sw_if=%u ret=%d\n", *sw_if_index, ret);
+        vpp_vxlan_tunnel_add_del(&tun, false, sw_if_index);
+        return ret;
+    }
+
+    SAIVPP_DEBUG("L3 VxLAN tunnel created: sw_if=%u vni=%u vrf=%u\n",
+                 *sw_if_index, vni, vrf_id);
+    return 0;
+}
+
+int vpp_l3_vxlan_tunnel_del(uint32_t sw_if_index, uint32_t src_ip, uint32_t dst_ip, uint32_t vni)
+{
+    vpp_vxlan_tunnel_t tun;
+    uint32_t idx = sw_if_index;
+    int ret;
+
+    /* Set interface admin DOWN first */
+    vpp_interface_set_state_by_index(sw_if_index, false);
+
+    memset(&tun, 0, sizeof(tun));
+    tun.src_address.sa_family = AF_INET;
+    tun.src_address.addr.ip4.sin_addr.s_addr = src_ip;
+    tun.dst_address.sa_family = AF_INET;
+    tun.dst_address.addr.ip4.sin_addr.s_addr = dst_ip;
+    tun.vni = vni;
+    tun.src_port = 4789;
+    tun.dst_port = 4789;
+    tun.instance = (uint32_t)~0;
+    tun.decap_next_index = (uint32_t)~0;
+    tun.is_l3 = true;
+
+    ret = vpp_vxlan_tunnel_add_del(&tun, false, &idx);
+    if (ret != 0) {
+        SAIVPP_ERROR("L3 VxLAN tunnel delete failed: sw_if=%u ret=%d\n", sw_if_index, ret);
+    }
+    return ret;
+}
+
 int vpp_ip_addr_t_to_string(vpp_ip_addr_t *ip_addr, char *buffer, size_t maxlen)
 {
     struct sockaddr_in *ip4;

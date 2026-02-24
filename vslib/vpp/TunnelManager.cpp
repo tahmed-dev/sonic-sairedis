@@ -188,7 +188,13 @@ TunnelManager::tunnel_encap_nexthop_action(
                     return SAI_STATUS_FAILURE;
                 }
 
-                if (create_vpp_vxlan_decap(tunnel_data) != SAI_STATUS_SUCCESS) {
+                /* Skip decap if this tunnel was reused from boot-time L3 setup —
+                 * vpp_l3_vxlan_tunnel_add already bound it to the VRF. */
+                auto existing = find_existing_vxlan_tunnel(req);
+                if (existing.first && existing.second == tunnel_data.sw_if_index) {
+                    SWSS_LOG_NOTICE("Reused L3 tunnel sw_if_index %d, skipping decap setup",
+                            tunnel_data.sw_if_index);
+                } else if (create_vpp_vxlan_decap(tunnel_data) != SAI_STATUS_SUCCESS) {
                     SWSS_LOG_ERROR("Failed to create vxlan decap for %s",
                         tunnel_nh_obj->get_id().c_str());
                     remove_vpp_vxlan_encap(req, tunnel_data);
@@ -240,6 +246,63 @@ TunnelManager::remove_tunnel_encap_nexthop(
     return tunnel_encap_nexthop_action(tunnel_nh_obj.get(), Action::DELETE);
 }
 
+std::pair<bool, uint32_t>
+TunnelManager::find_existing_vxlan_tunnel(
+                    _In_ const vpp_vxlan_tunnel_t& req)
+{
+    SWSS_LOG_ENTER();
+
+    /* Convert req IPs to sai_ip_address_t for comparison with L3TunnelVPPData */
+    sai_ip_address_t req_src, req_dst;
+    memset(&req_src, 0, sizeof(req_src));
+    memset(&req_dst, 0, sizeof(req_dst));
+
+    if (req.src_address.sa_family == AF_INET)
+    {
+        req_src.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
+        memcpy(&req_src.addr.ip4, &req.src_address.addr.ip4.sin_addr, 4);
+        req_dst.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
+        memcpy(&req_dst.addr.ip4, &req.dst_address.addr.ip4.sin_addr, 4);
+    }
+    else
+    {
+        req_src.addr_family = SAI_IP_ADDR_FAMILY_IPV6;
+        memcpy(&req_src.addr.ip6, &req.src_address.addr.ip6.sin6_addr, 16);
+        req_dst.addr_family = SAI_IP_ADDR_FAMILY_IPV6;
+        memcpy(&req_dst.addr.ip6, &req.dst_address.addr.ip6.sin6_addr, 16);
+    }
+
+    for (const auto& pair : m_l3_tunnel_map)
+    {
+        const auto& data = pair.second;
+        if (data.vni != req.vni)
+            continue;
+        if (data.src_ip.addr_family != req_src.addr_family)
+            continue;
+
+        bool src_match, dst_match;
+        if (req_src.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
+        {
+            src_match = (memcmp(&req_src.addr.ip4, &data.src_ip.addr.ip4, 4) == 0);
+            dst_match = (memcmp(&req_dst.addr.ip4, &data.dst_ip.addr.ip4, 4) == 0);
+        }
+        else
+        {
+            src_match = (memcmp(&req_src.addr.ip6, &data.src_ip.addr.ip6, 16) == 0);
+            dst_match = (memcmp(&req_dst.addr.ip6, &data.dst_ip.addr.ip6, 16) == 0);
+        }
+
+        if (src_match && dst_match)
+        {
+            SWSS_LOG_NOTICE("find_existing_vxlan_tunnel: found L3 tunnel vni=%d sw_if_index=%d",
+                    data.vni, data.sw_if_index);
+            return {true, data.sw_if_index};
+        }
+    }
+
+    return {false, 0};
+}
+
 sai_status_t
 TunnelManager::create_vpp_vxlan_encap(
                     _In_  vpp_vxlan_tunnel_t& req,
@@ -274,8 +337,18 @@ TunnelManager::create_vpp_vxlan_encap(
     }
 
     if (vpp_status != 0) {
-        SWSS_LOG_ERROR("Failed to create vxlan tunnel");
-        return SAI_STATUS_FAILURE;
+        // Tunnel may already exist (e.g., L3 VxLAN tunnel created at boot by
+        // vpp_l3_vxlan_tunnel_add).  Look up existing tunnel by src/dst/VNI
+        // and reuse its sw_if_index instead of failing.
+        auto existing = find_existing_vxlan_tunnel(req);
+        if (existing.first) {
+            sw_if_index = existing.second;
+            SWSS_LOG_NOTICE("VxLAN tunnel already exists (src %s dst %s vni %d), reusing sw_if_index %d",
+                    src_ip_str, dst_ip_str, req.vni, sw_if_index);
+        } else {
+            SWSS_LOG_ERROR("Failed to create vxlan tunnel");
+            return SAI_STATUS_FAILURE;
+        }
     }
     tunnel_data.sw_if_index = sw_if_index;
     /* the neighbour is to build inner ether. use no_fib_entry to avoid creating the nh in the fib, which will mess up underlay forwarding*/
@@ -306,6 +379,16 @@ TunnelManager::remove_vpp_vxlan_encap(
         ip6_nbr_add_del(NULL, tunnel_data.sw_if_index, &req.dst_address.addr.ip6, false, true/*no_fib_entry*/, bvi_mac, 0);
     } else {
         ip4_nbr_add_del(NULL, tunnel_data.sw_if_index, &req.dst_address.addr.ip4, false, true/*no_fib_entry*/, bvi_mac, 0);
+    }
+
+    /* Don't delete the VxLAN tunnel if it's a shared L3 tunnel created at
+     * boot — it's managed by vpp_l3_vxlan_tunnel_add/remove lifecycle,
+     * not by per-nexthop lifecycle. */
+    auto existing = find_existing_vxlan_tunnel(req);
+    if (existing.first && existing.second == tunnel_data.sw_if_index) {
+        SWSS_LOG_NOTICE("Skipping VxLAN tunnel delete — shared L3 tunnel sw_if_index %d",
+                tunnel_data.sw_if_index);
+        return SAI_STATUS_SUCCESS;
     }
 
     vpp_status = vpp_vxlan_tunnel_add_del(&req, 0, &sw_if_index);
@@ -671,6 +754,112 @@ TunnelManager::remove_l2_vxlan_tunnel(
 
     // Remove from map
     m_l2_tunnel_map.erase(it);
+
+    return SAI_STATUS_SUCCESS;
+}
+
+// ─── L3 VxLAN Tunnel (VRF-bound) ──────────────────────────────────────────────
+
+sai_status_t
+TunnelManager::create_l3_vxlan_tunnel(
+    _In_ sai_object_id_t tunnel_oid,
+    _In_ uint32_t vni,
+    _In_ uint32_t vrf_id,
+    _In_ const sai_ip_address_t &src,
+    _In_ const sai_ip_address_t &dst)
+{
+    SWSS_LOG_ENTER();
+
+    // Check if already created
+    auto it = m_l3_tunnel_map.find(tunnel_oid);
+    if (it != m_l3_tunnel_map.end()) {
+        SWSS_LOG_NOTICE("L3 VxLAN tunnel already exists: tunnel=%s sw_if=%u",
+            sai_serialize_object_id(tunnel_oid).c_str(), it->second.sw_if_index);
+        return SAI_STATUS_SUCCESS;
+    }
+
+    // Only IPv4 src/dst supported for now
+    if (src.addr_family != SAI_IP_ADDR_FAMILY_IPV4 ||
+        dst.addr_family != SAI_IP_ADDR_FAMILY_IPV4) {
+        SWSS_LOG_ERROR("L3 VxLAN tunnel: only IPv4 VTEP addresses supported");
+        return SAI_STATUS_NOT_IMPLEMENTED;
+    }
+
+    uint32_t sw_if_index = 0;
+    int ret = vpp_l3_vxlan_tunnel_add(
+        src.addr.ip4, dst.addr.ip4, vni, vrf_id, &sw_if_index);
+
+    if (ret != 0) {
+        SWSS_LOG_ERROR("Failed to create L3 VxLAN tunnel: VNI=%u VRF=%u ret=%d",
+            vni, vrf_id, ret);
+        return SAI_STATUS_FAILURE;
+    }
+
+    if (sw_if_index == 0) {
+        SWSS_LOG_ERROR("L3 VxLAN tunnel returned sw_if_index=0 (local0)");
+        return SAI_STATUS_FAILURE;
+    }
+
+    // Add static neighbor for inner Ethernet header (same pattern as L2)
+    auto router_mac = get_router_mac();
+    auto bvi_mac = router_mac.data();
+    vpp_ip_addr_t dst_vpp;
+    sai_ip_address_t dst_copy = dst;
+    sai_ip_address_t_to_vpp_ip_addr_t(dst_copy, dst_vpp);
+    ip4_nbr_add_del(NULL, sw_if_index, &dst_vpp.addr.ip4,
+                     false, true/*no_fib_entry*/, bvi_mac, 1);
+
+    L3TunnelVPPData data;
+    data.sw_if_index = sw_if_index;
+    data.vni = vni;
+    data.vrf_id = vrf_id;
+    data.src_ip = src;
+    data.dst_ip = dst;
+    data.tunnel_oid = tunnel_oid;
+
+    m_l3_tunnel_map[tunnel_oid] = data;
+
+    SWSS_LOG_NOTICE("Created L3 VxLAN: tunnel=%s VNI=%u VRF=%u sw_if=%u",
+        sai_serialize_object_id(tunnel_oid).c_str(), vni, vrf_id, sw_if_index);
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t
+TunnelManager::remove_l3_vxlan_tunnel(
+    _In_ sai_object_id_t tunnel_oid)
+{
+    SWSS_LOG_ENTER();
+
+    auto it = m_l3_tunnel_map.find(tunnel_oid);
+    if (it == m_l3_tunnel_map.end()) {
+        SWSS_LOG_NOTICE("Tunnel %s not in L3 tunnel map, skipping removal",
+            sai_serialize_object_id(tunnel_oid).c_str());
+        return SAI_STATUS_SUCCESS;
+    }
+
+    L3TunnelVPPData& data = it->second;
+
+    // Remove static neighbor
+    auto router_mac = get_router_mac();
+    auto bvi_mac = router_mac.data();
+    vpp_ip_addr_t dst_vpp;
+    sai_ip_address_t_to_vpp_ip_addr_t(data.dst_ip, dst_vpp);
+    ip4_nbr_add_del(NULL, data.sw_if_index, &dst_vpp.addr.ip4,
+                     false, true/*no_fib_entry*/, bvi_mac, 0);
+
+    int ret = vpp_l3_vxlan_tunnel_del(
+        data.sw_if_index, data.src_ip.addr.ip4, data.dst_ip.addr.ip4, data.vni);
+    if (ret != 0) {
+        SWSS_LOG_ERROR("Failed to delete L3 VxLAN tunnel sw_if=%u: ret=%d",
+            data.sw_if_index, ret);
+    }
+
+    SWSS_LOG_NOTICE("Removed L3 VxLAN tunnel %s (sw_if=%u, VNI=%u, VRF=%u)",
+        sai_serialize_object_id(tunnel_oid).c_str(),
+        data.sw_if_index, data.vni, data.vrf_id);
+
+    m_l3_tunnel_map.erase(it);
 
     return SAI_STATUS_SUCCESS;
 }

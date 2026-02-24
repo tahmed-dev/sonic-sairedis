@@ -372,6 +372,10 @@ typedef enum {
                            vpp_ip_addr_t *peer_addr);
 
     extern int vpp_vxlan_tunnel_add_del(vpp_vxlan_tunnel_t *tunnel, bool is_add,  uint32_t *sw_if_index);
+    extern int vpp_l3_vxlan_tunnel_add(uint32_t src_ip, uint32_t dst_ip, uint32_t vni, uint32_t vrf_id, uint32_t *sw_if_index);
+    extern int vpp_l3_vxlan_tunnel_del(uint32_t sw_if_index, uint32_t src_ip, uint32_t dst_ip, uint32_t vni);
+    extern int vpp_set_interface_vrf_by_index(uint32_t sw_if_index, uint32_t vrf_id, bool is_ipv6);
+    extern int vpp_interface_set_state_by_index(uint32_t sw_if_index, bool is_up);
     extern int vpp_ip_addr_t_to_string(vpp_ip_addr_t *ip_addr, char *buffer, size_t maxlen);
     extern int vpp_my_sid_entry_add_del(vpp_my_sid_entry_t *my_sid, bool is_del);
     extern int vpp_sidlist_add(vpp_sidlist_t *sidlist);

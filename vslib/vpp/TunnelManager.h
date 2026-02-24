@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <map>
 #include "SwitchVpp.h"
 #include "vppxlate/SaiVppXlate.h"
 
@@ -35,6 +36,24 @@ namespace saivs
         u_int16_t vlan_id = 0;
         sai_ip_address_t src_ip;
         sai_ip_address_t dst_ip;
+    };
+
+    /**
+     * @brief L3 VxLAN tunnel data — tunnel bound to a VRF (not a bridge domain).
+     */
+    struct L3TunnelVPPData {
+        uint32_t sw_if_index = 0;
+        uint32_t vni = 0;
+        uint32_t vrf_id = 0;           // VPP FIB table ID
+        sai_ip_address_t src_ip;
+        sai_ip_address_t dst_ip;
+        sai_object_id_t tunnel_oid;
+
+        L3TunnelVPPData() {
+            memset(&src_ip, 0, sizeof(src_ip));
+            memset(&dst_ip, 0, sizeof(dst_ip));
+            tunnel_oid = SAI_NULL_OBJECT_ID;
+        }
     };
 
     class TunnelManager {
@@ -158,6 +177,45 @@ namespace saivs
             return true;
         }
 
+        /**
+         * @brief Create an L3 VxLAN tunnel bound to a VRF FIB table.
+         *
+         * Unlike L2 tunnels which are added to a bridge domain, L3 tunnels are
+         * placed into a VRF so that routed traffic can be encapsulated in VxLAN.
+         *
+         * @param tunnel_oid SAI tunnel object ID.
+         * @param vni VxLAN Network Identifier (L3 VNI).
+         * @param vrf_id VPP FIB table ID for the overlay VRF.
+         * @param src Source VTEP IP address.
+         * @param dst Destination (remote) VTEP IP address.
+         * @return SAI_STATUS_SUCCESS on success.
+         */
+        sai_status_t create_l3_vxlan_tunnel(
+            _In_ sai_object_id_t tunnel_oid,
+            _In_ uint32_t vni,
+            _In_ uint32_t vrf_id,
+            _In_ const sai_ip_address_t &src,
+            _In_ const sai_ip_address_t &dst);
+
+        /**
+         * @brief Remove an L3 VxLAN tunnel.
+         */
+        sai_status_t remove_l3_vxlan_tunnel(
+            _In_ sai_object_id_t tunnel_oid);
+
+        /**
+         * @brief Look up L3 VxLAN tunnel data by SAI tunnel OID.
+         * @return true if found, data populated; false otherwise.
+         */
+        bool getL3TunnelInfo(sai_object_id_t tunnelOid, L3TunnelVPPData &data) const
+        {
+            auto it = m_l3_tunnel_map.find(tunnelOid);
+            if (it == m_l3_tunnel_map.end())
+                return false;
+            data = it->second;
+            return true;
+        }
+
     private:
         SwitchVpp* m_switch_db;
         std::array<uint8_t, 6> m_router_mac;
@@ -166,10 +224,19 @@ namespace saivs
         std::unordered_map<sai_object_id_t, TunnelVPPData> m_tunnel_encap_nexthop_map;
         // Map from tunnel SAI OID to VPP tunnel data (L2 VXLAN / EVPN)
         std::unordered_map<sai_object_id_t, TunnelVPPData> m_l2_tunnel_map;
+        // Map from tunnel SAI OID to L3 VxLAN tunnel data (VRF-bound)
+        std::map<sai_object_id_t, L3TunnelVPPData> m_l3_tunnel_map;
 
         sai_status_t tunnel_encap_nexthop_action(
                         _In_ const SaiObject* tunnel_nh_obj,
                         _In_ Action action);
+
+        /**
+         * @brief Find an existing VxLAN tunnel in m_l3_tunnel_map matching src/dst/VNI.
+         * @return pair<true, sw_if_index> if found, pair<false, 0> otherwise.
+         */
+        std::pair<bool, uint32_t> find_existing_vxlan_tunnel(
+                        _In_ const vpp_vxlan_tunnel_t& req);
 
         sai_status_t create_vpp_vxlan_encap(
                         _In_  vpp_vxlan_tunnel_t& req,
