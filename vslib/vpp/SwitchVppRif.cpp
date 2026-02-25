@@ -1084,16 +1084,21 @@ sai_status_t SwitchVpp::vpp_add_del_intf_ip_addr_norif (
     }
 
     /*
-     * Move the BVI IP from SONiC's Vlan<N> to the LCP tap (bvivlan<N>).
+     * Add the BVI IP to the LCP tap (bvivlan<N>) in addition to Vlan<N>.
      *
-     * SONiC's intfmgrd assigns the IP to the kernel's Vlan<N> interface,
-     * but VPP punts L3 traffic via the BVI's LCP tap (bvivlan<N>).  If
-     * both interfaces carry the same IP, the kernel routing table has two
-     * routes for the same subnet and may prefer the wrong one.
+     * SONiC's intfmgrd assigns the IP to the kernel's Vlan<N> interface.
+     * VPP punts L3 traffic via the BVI's LCP tap (bvivlan<N>), so the IP
+     * must also be present there.
      *
-     * Fix: on add, program IP on bvivlan<N> and remove from Vlan<N>.
-     *      on del, remove from bvivlan<N> (Vlan<N> removal handled by
-     *      SONiC's intfmgrd).
+     * Keep the IP on BOTH interfaces:
+     *   - bvivlan<N>: VPP data-plane L3 traffic (BVI punt path)
+     *   - Vlan<N>:    FRR EVPN neighbor install (dplane_local_neigh_add
+     *                 requires an IPv4 address on the SVI for the kernel
+     *                 to accept RTM_NEWNEIGH entries)
+     *
+     * The kernel prefers bvivlan<N> for forwarding (lower metric / more
+     * specific connected route) so duplicate-subnet routing is not an
+     * issue in practice.
      */
     if (full_if_name.compare(0, vlan_prefix.length(), vlan_prefix) == 0 && vlan_id > 0)
     {
@@ -1117,19 +1122,13 @@ sai_status_t SwitchVpp::vpp_add_del_intf_ip_addr_norif (
                           is_add ? "add" : "remove", vlan_id);
         }
 
-        /*
-         * Remove the duplicate IP from Vlan<N> so the kernel has a single
-         * route via bvivlan<N>.  On delete, SONiC's intfmgrd handles the
-         * Vlan<N> removal, so we only act on add.
-         */
-        if (is_add) {
-            snprintf(cmd, sizeof(cmd), "ip addr del %s/%d dev Vlan%u 2>/dev/null",
-                     ip_str, prefix_len, vlan_id);
-            (void)!system(cmd);  /* best-effort; may already be absent */
-        }
+        /* Keep IP on Vlan<N> — do NOT remove it.  FRR's zebra resolves the
+         * EVPN SVI as Vlan<N> (ZEBRA_IF_VLAN) and installs MH sync
+         * neighbors there via dplane_local_neigh_add().  The kernel rejects
+         * RTM_NEWNEIGH if the interface has no IPv4 address. */
 
-        SWSS_LOG_NOTICE("BVI LCP tap IP %s on bvivlan%u",
-                        is_add ? "added" : "removed", vlan_id);
+        SWSS_LOG_NOTICE("BVI LCP tap IP %s on bvivlan%u (also kept on Vlan%u)",
+                        is_add ? "added" : "removed", vlan_id, vlan_id);
     }
 
     if (ret != 0)
