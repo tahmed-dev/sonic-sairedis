@@ -520,18 +520,22 @@ sai_status_t SwitchVpp::vpp_create_bvi_interface(
         }
 
         /*
-         * Enable proxy ARP on the BVI tap.  intfmgrd sets proxy_arp on
-         * the kernel "Vlan<N>" interface based on ConfigDB, but in VPP
-         * mode the actual data-plane tap is "bvivlan<N>".  Without this,
-         * the BVI won't respond to ARP requests on behalf of remote hosts,
-         * breaking EVPN MH overlay connectivity.
+         * Do NOT enable kernel proxy_arp on the BVI tap.  VPP's BD arp-term
+         * now handles all proxy ARP with the SVI MAC (anycast gateway MAC).
+         * Kernel proxy_arp is harmful: it creates bvivlan<N> neighbor entries
+         * with the SVI MAC, which VPP's LCP syncs into the ip4 FIB, causing
+         * L3 hairpin reflection drops (packet sent to BVI's own MAC loops
+         * back to BVI instead of reaching the correct BD port).
+         *
+         * Explicitly DISABLE proxy_arp to prevent stale entries if it was
+         * previously enabled (e.g., by intfmgrd on the Vlan<N> interface).
          */
         snprintf(cmd, sizeof(cmd),
-                 "sysctl -qw net.ipv4.conf.%s.proxy_arp=1 "
-                 "net.ipv4.conf.%s.proxy_arp_pvlan=1",
+                 "sysctl -qw net.ipv4.conf.%s.proxy_arp=0 "
+                 "net.ipv4.conf.%s.proxy_arp_pvlan=0",
                  host_ifname, host_ifname);
         if (system(cmd) != 0) {
-            SWSS_LOG_WARN("Failed to enable proxy_arp on %s", host_ifname);
+            SWSS_LOG_WARN("Failed to disable proxy_arp on %s", host_ifname);
         }
     }
 
@@ -1709,6 +1713,22 @@ void SwitchVpp::vppPollFdb()
                 kv.first.bd_id, port_name);
 
         processFdbInfo(fi, SAI_FDB_EVENT_LEARNED);
+
+        /* Sync to kernel bridge FDB for FRR EVPN MH neighbor tracking */
+        const char *linux_port = hwif_to_tap_name(port_name);
+        if (linux_port && strcmp(linux_port, "Unknown") != 0)
+        {
+            char fdb_cmd[256];
+            snprintf(fdb_cmd, sizeof(fdb_cmd),
+                     "bridge fdb replace %02x:%02x:%02x:%02x:%02x:%02x "
+                     "dev %s master vlan %u extern_learn 2>/dev/null",
+                     kv.first.mac[0], kv.first.mac[1], kv.first.mac[2],
+                     kv.first.mac[3], kv.first.mac[4], kv.first.mac[5],
+                     linux_port, kv.first.bd_id);
+            if (system(fdb_cmd) != 0) {
+                SWSS_LOG_DEBUG("vppPollFdb: kernel bridge FDB sync cmd failed");
+            }
+        }
     }
 
     /* Diff: find aged MACs (in cache but not in new_fdb) */
@@ -1785,6 +1805,28 @@ void SwitchVpp::vppPollFdb()
                 kv.first.bd_id);
 
         processFdbInfo(fi, SAI_FDB_EVENT_AGED);
+
+        /* Sync deletion to kernel bridge FDB */
+        {
+            const char *hwif = vpp_get_swif_name(kv.second.sw_if_index);
+            if (hwif)
+            {
+                const char *linux_port = hwif_to_tap_name(hwif);
+                if (linux_port && strcmp(linux_port, "Unknown") != 0)
+                {
+                    char fdb_cmd[256];
+                    snprintf(fdb_cmd, sizeof(fdb_cmd),
+                             "bridge fdb del %02x:%02x:%02x:%02x:%02x:%02x "
+                             "dev %s master vlan %u 2>/dev/null",
+                             kv.first.mac[0], kv.first.mac[1], kv.first.mac[2],
+                             kv.first.mac[3], kv.first.mac[4], kv.first.mac[5],
+                             linux_port, kv.first.bd_id);
+                    if (system(fdb_cmd) != 0) {
+                        SWSS_LOG_DEBUG("vppPollFdb: kernel bridge FDB del failed");
+                    }
+                }
+            }
+        }
     }
 
     /* Update the cache */
@@ -2056,5 +2098,52 @@ void SwitchVpp::vppProcessL2MacEvent(
                 vlan_id, port_name, entry.action);
 
         processFdbInfo(fi, fdb_event);
+
+        /*
+         * Sync MAC to kernel bridge FDB so FRR zebra can track MAC learning
+         * events for EVPN MH peer-sync. VPP handles L2 forwarding but the
+         * kernel bridge FDB is empty — FRR's EVPN MH neighbor sync relies on
+         * kernel bridge FDB notifications (RTM_NEWNEIGH) to detect MAC
+         * local-inactive transitions and program peer-sync neighbors.
+         *
+         * We use `bridge fdb replace/del` with `extern_learn` to indicate the
+         * entry is offloaded to the dataplane (VPP). FRR zebra picks these up
+         * via its netlink listener on the Bridge interface.
+         *
+         * port_name here is the VPP hwif name (e.g. "BondEthernet0").
+         * We need the kernel interface name (e.g. "PortChannel0").
+         */
+        const char *linux_port = hwif_to_tap_name(port_name);
+        if (linux_port && strcmp(linux_port, "Unknown") != 0)
+        {
+            char fdb_cmd[256];
+            if (fdb_event == SAI_FDB_EVENT_LEARNED)
+            {
+                snprintf(fdb_cmd, sizeof(fdb_cmd),
+                         "bridge fdb replace %02x:%02x:%02x:%02x:%02x:%02x "
+                         "dev %s master vlan %u extern_learn 2>/dev/null",
+                         entry.mac[0], entry.mac[1], entry.mac[2],
+                         entry.mac[3], entry.mac[4], entry.mac[5],
+                         linux_port, vlan_id);
+            }
+            else
+            {
+                snprintf(fdb_cmd, sizeof(fdb_cmd),
+                         "bridge fdb del %02x:%02x:%02x:%02x:%02x:%02x "
+                         "dev %s master vlan %u 2>/dev/null",
+                         entry.mac[0], entry.mac[1], entry.mac[2],
+                         entry.mac[3], entry.mac[4], entry.mac[5],
+                         linux_port, vlan_id);
+            }
+
+            if (system(fdb_cmd) == 0)
+            {
+                SWSS_LOG_NOTICE("vppProcessL2MacEvent: kernel bridge FDB sync: %s", fdb_cmd);
+            }
+            else
+            {
+                SWSS_LOG_WARN("vppProcessL2MacEvent: kernel bridge FDB sync failed: %s", fdb_cmd);
+            }
+        }
     }
 }
