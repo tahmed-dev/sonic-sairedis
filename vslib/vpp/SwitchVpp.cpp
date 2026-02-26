@@ -1530,6 +1530,11 @@ sai_status_t SwitchVpp::set(
         return setLag(objectId, attr);
     }
 
+    if (objectType == SAI_OBJECT_TYPE_NEXT_HOP_GROUP_MEMBER)
+    {
+        return setNexthopGroupMember(serializedObjectId, attr);
+    }
+
     return set_internal(objectType, serializedObjectId, attr);
 }
 

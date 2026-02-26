@@ -98,7 +98,7 @@ void create_vpp_nexthop_entry (
     vpp_nexthop->hwif_name = hwif_name;
     vpp_nexthop->sw_if_index = nxt_grp_member->sw_if_index;
     vpp_nexthop->weight = (uint8_t) nxt_grp_member->weight;
-    vpp_nexthop->preference = 0;
+    vpp_nexthop->preference = nxt_grp_member->preference; /* HW FRR: 0=primary, 1+=backup */
 }
 
 sai_status_t SwitchVpp::IpRouteAddRemove(

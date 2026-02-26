@@ -340,6 +340,7 @@ typedef enum {
     extern int create_bond_member(uint32_t bond_sw_if_index, const char *hwif_name, bool is_passive, bool is_long_timeout);
     extern int delete_bond_member(const char * hwif_name);
     extern const char * vpp_get_swif_name(const uint32_t swif_idx);
+    extern uint32_t vpp_get_swif_idx(const char *ifname);
     extern int l2fib_add_del(const char *hwif_name, const uint8_t *mac, uint32_t bd_id, bool is_add, bool is_static_mac);
     extern int l2fib_flush_all();
     extern int l2fib_flush_int(const char *hwif_name);

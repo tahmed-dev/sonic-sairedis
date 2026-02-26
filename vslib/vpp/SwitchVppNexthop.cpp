@@ -45,9 +45,17 @@ sai_status_t SwitchVpp::IpRouteNexthopGroupEntry(
 
     CHECK_STATUS_QUIET(nhg_obj->get_mandatory_attr(attr));
     if (attr.value.s32 != SAI_NEXT_HOP_GROUP_TYPE_DYNAMIC_UNORDERED_ECMP &&
-        attr.value.s32 != SAI_NEXT_HOP_GROUP_TYPE_DYNAMIC_ORDERED_ECMP) {
+        attr.value.s32 != SAI_NEXT_HOP_GROUP_TYPE_DYNAMIC_ORDERED_ECMP &&
+        attr.value.s32 != SAI_NEXT_HOP_GROUP_TYPE_PROTECTION &&
+        attr.value.s32 != SAI_NEXT_HOP_GROUP_TYPE_HW_PROTECTION) {
         SWSS_LOG_ERROR("Unsupported type (%d) in nexthop group %s", attr.value.s32, nhg_soid.c_str());
             return SAI_STATUS_NOT_IMPLEMENTED;
+    }
+
+    /* Dispatch PROTECTION/HW_PROTECTION to dedicated handler */
+    if (attr.value.s32 == SAI_NEXT_HOP_GROUP_TYPE_PROTECTION ||
+        attr.value.s32 == SAI_NEXT_HOP_GROUP_TYPE_HW_PROTECTION) {
+        return IpRouteNexthopGroupProtection(next_hop_grp_oid, nxthop_group);
     }
 
     group_type = attr.value.s32;
@@ -112,6 +120,128 @@ sai_status_t SwitchVpp::IpRouteNexthopGroupEntry(
 
     *nxthop_group = nxthop_grp_cfg;
 
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchVpp::IpRouteNexthopGroupProtection(
+    _In_ sai_object_id_t next_hop_grp_oid,
+    _Out_ nexthop_grp_config_t **nxthop_group)
+{
+    SWSS_LOG_ENTER();
+
+    sai_attribute_t attr;
+    auto nhg_soid = sai_serialize_object_id(next_hop_grp_oid);
+
+    auto nhg_obj = get_sai_object(SAI_OBJECT_TYPE_NEXT_HOP_GROUP, nhg_soid);
+    if (!nhg_obj) {
+        SWSS_LOG_ERROR("Failed to find NEXT_HOP_GROUP: %s", nhg_soid.c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    attr.id = SAI_NEXT_HOP_GROUP_ATTR_TYPE;
+    CHECK_STATUS_QUIET(nhg_obj->get_mandatory_attr(attr));
+    int32_t nhg_type = attr.value.s32;
+
+    auto member_map = nhg_obj->get_child_objs(SAI_OBJECT_TYPE_NEXT_HOP_GROUP_MEMBER);
+    if (member_map == nullptr || member_map->size() == 0) {
+        SWSS_LOG_INFO("Empty protection NHG %s", nhg_soid.c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    /*
+     * Collect all members with their roles and preferences.
+     * For PROTECTION NHGs:
+     *   - PRIMARY members get preference 0
+     *   - STANDBY members get preference 1
+     *   - If a member's NEXT_HOP_ID points to another NHG (HW_PROTECTION),
+     *     we recursively expand its members with the standby preference.
+     * For HW_PROTECTION NHGs:
+     *   - All members get preference 1 (they are backup paths)
+     */
+    std::vector<nexthop_grp_member_t> all_members;
+
+    for (auto &pair : *member_map) {
+        auto member_obj = pair.second;
+        uint8_t member_preference = 0;
+
+        /* Determine role → preference */
+        if (nhg_type == SAI_NEXT_HOP_GROUP_TYPE_PROTECTION) {
+            attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_CONFIGURED_ROLE;
+            int32_t role = SAI_NEXT_HOP_GROUP_MEMBER_CONFIGURED_ROLE_PRIMARY;
+            if (member_obj->get_attr(attr) == SAI_STATUS_SUCCESS) {
+                role = attr.value.s32;
+            }
+            member_preference = (role == SAI_NEXT_HOP_GROUP_MEMBER_CONFIGURED_ROLE_PRIMARY) ? 0 : 1;
+        } else {
+            /* HW_PROTECTION: all members are backup (preference 1) */
+            member_preference = 1;
+        }
+
+        /* Get the nexthop OID (can be NH or NHG) */
+        attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_ID;
+        CHECK_STATUS_QUIET(member_obj->get_mandatory_attr(attr));
+        sai_object_id_t nh_oid = attr.value.oid;
+
+        auto nh_obj_type = RealObjectIdManager::objectTypeQuery(nh_oid);
+
+        if (nh_obj_type == SAI_OBJECT_TYPE_NEXT_HOP_GROUP) {
+            /* Member points to another NHG (typically HW_PROTECTION as standby).
+             * Recursively expand its members. */
+            nexthop_grp_config_t *sub_group = nullptr;
+            auto status = IpRouteNexthopGroupProtection(nh_oid, &sub_group);
+            if (status == SAI_STATUS_SUCCESS && sub_group) {
+                for (uint32_t i = 0; i < sub_group->nmembers; i++) {
+                    /* Propagate the parent's preference (standby=1) to all sub-members */
+                    sub_group->grp_members[i].preference = member_preference;
+                    all_members.push_back(sub_group->grp_members[i]);
+                }
+                free(sub_group);
+            } else {
+                SWSS_LOG_WARN("Failed to expand sub-NHG %s in protection group %s",
+                              sai_serialize_object_id(nh_oid).c_str(), nhg_soid.c_str());
+            }
+        } else if (nh_obj_type == SAI_OBJECT_TYPE_NEXT_HOP) {
+            /* Direct NH member */
+            nexthop_grp_member_t mbr = {};
+            if (fillNHGrpMember(&mbr, nh_oid, 1, 0) == SAI_STATUS_SUCCESS) {
+                mbr.preference = member_preference;
+                all_members.push_back(mbr);
+                SWSS_LOG_INFO("Protection NHG %s: added NH %s preference=%u",
+                              nhg_soid.c_str(),
+                              sai_serialize_object_id(nh_oid).c_str(),
+                              member_preference);
+            }
+        } else {
+            SWSS_LOG_WARN("Unexpected object type %d for NH in protection NHG %s",
+                          nh_obj_type, nhg_soid.c_str());
+        }
+    }
+
+    if (all_members.empty()) {
+        SWSS_LOG_ERROR("No valid members in protection NHG %s", nhg_soid.c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    /* Build the nexthop group config */
+    size_t grp_size = sizeof(nexthop_grp_config_t) +
+                      (all_members.size() * sizeof(nexthop_grp_member_t));
+    auto *cfg = (nexthop_grp_config_t *)calloc(1, grp_size);
+    if (!cfg) {
+        SWSS_LOG_ERROR("Failed to allocate nexthop_grp_config_t for %zu members",
+                       all_members.size());
+        return SAI_STATUS_FAILURE;
+    }
+
+    cfg->grp_type = nhg_type;
+    cfg->nmembers = (uint32_t)all_members.size();
+    for (uint32_t i = 0; i < cfg->nmembers; i++) {
+        cfg->grp_members[i] = all_members[i];
+    }
+
+    *nxthop_group = cfg;
+
+    SWSS_LOG_NOTICE("Protection NHG %s: %u members (type=%d)",
+                    nhg_soid.c_str(), cfg->nmembers, nhg_type);
     return SAI_STATUS_SUCCESS;
 }
 
@@ -192,7 +322,65 @@ SwitchVpp::fillNHGrpMember(nexthop_grp_member_t *nxt_grp_member, sai_object_id_t
     case SAI_NEXT_HOP_TYPE_IP:
         attr.id = SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID;
         if (get(SAI_OBJECT_TYPE_NEXT_HOP, next_hop_oid, 1, &attr) == SAI_STATUS_SUCCESS) {
-            nxt_grp_member->rif_oid = attr.value.oid;
+            sai_object_id_t rif_oid = attr.value.oid;
+            nxt_grp_member->rif_oid = rif_oid;
+
+            /*
+             * Resolve the RIF to a VPP interface sw_if_index so that
+             * ip_route_add_del programs an attached (not recursive) path.
+             * Without this, multipath routes where the NH IP equals the
+             * route prefix (e.g. PROTECTION NHG for /32 host routes)
+             * cause circular recursion → drop in VPP.
+             */
+            sai_attribute_t rif_attr;
+            rif_attr.id = SAI_ROUTER_INTERFACE_ATTR_TYPE;
+            if (get(SAI_OBJECT_TYPE_ROUTER_INTERFACE, rif_oid, 1, &rif_attr) == SAI_STATUS_SUCCESS) {
+                int32_t rif_type = rif_attr.value.s32;
+                std::string vpp_ifname;
+
+                if (rif_type == SAI_ROUTER_INTERFACE_TYPE_VLAN) {
+                    /* BVI interface: bvi<vlan_id> */
+                    rif_attr.id = SAI_ROUTER_INTERFACE_ATTR_VLAN_ID;
+                    if (get(SAI_OBJECT_TYPE_ROUTER_INTERFACE, rif_oid, 1, &rif_attr) == SAI_STATUS_SUCCESS) {
+                        auto vlan_obj = get_sai_object(SAI_OBJECT_TYPE_VLAN,
+                            sai_serialize_object_id(rif_attr.value.oid));
+                        if (vlan_obj) {
+                            sai_attribute_t vlan_attr;
+                            vlan_attr.id = SAI_VLAN_ATTR_VLAN_ID;
+                            if (vlan_obj->get_attr(vlan_attr) == SAI_STATUS_SUCCESS) {
+                                vpp_ifname = "bvi" + std::to_string(vlan_attr.value.u16);
+                            }
+                        }
+                    }
+                } else if (rif_type == SAI_ROUTER_INTERFACE_TYPE_PORT ||
+                           rif_type == SAI_ROUTER_INTERFACE_TYPE_SUB_PORT) {
+                    /* Physical/LAG/sub-port: resolve via vpp_get_hwif_name */
+                    rif_attr.id = SAI_ROUTER_INTERFACE_ATTR_PORT_ID;
+                    if (get(SAI_OBJECT_TYPE_ROUTER_INTERFACE, rif_oid, 1, &rif_attr) == SAI_STATUS_SUCCESS) {
+                        uint16_t vlan_id = 0;
+                        if (rif_type == SAI_ROUTER_INTERFACE_TYPE_SUB_PORT) {
+                            sai_attribute_t vlan_attr;
+                            vlan_attr.id = SAI_ROUTER_INTERFACE_ATTR_OUTER_VLAN_ID;
+                            if (get(SAI_OBJECT_TYPE_ROUTER_INTERFACE, rif_oid, 1, &vlan_attr) == SAI_STATUS_SUCCESS) {
+                                vlan_id = vlan_attr.value.u16;
+                            }
+                        }
+                        vpp_get_hwif_name(rif_attr.value.oid, vlan_id, vpp_ifname);
+                    }
+                }
+
+                if (!vpp_ifname.empty()) {
+                    uint32_t resolved_idx = vpp_get_swif_idx(vpp_ifname.c_str());
+                    if (resolved_idx != (uint32_t)~0) {
+                        nxt_grp_member->sw_if_index = resolved_idx;
+                        SWSS_LOG_NOTICE("IP NH %s: resolved RIF to VPP interface %s (sw_if_index=%u)",
+                                        nh_soid.c_str(), vpp_ifname.c_str(), resolved_idx);
+                    } else {
+                        SWSS_LOG_WARN("IP NH %s: VPP interface %s not found in sw_if_index table",
+                                      nh_soid.c_str(), vpp_ifname.c_str());
+                    }
+                }
+            }
         }
         break;
     case SAI_NEXT_HOP_TYPE_TUNNEL_ENCAP: {
@@ -340,9 +528,78 @@ SwitchVpp::removeNexthopGroupMember(
     }
 
     for (auto route : *routes) {
-        SWSS_LOG_INFO("NHG member changed. Updating route %s", route.first.c_str());
+        SWSS_LOG_INFO("NHG member removed. Updating route %s", route.first.c_str());
         IpRouteAddRemove(route.second.get(), false);
         IpRouteAddRemove(route.second.get(), true);
     }
+    return SAI_STATUS_SUCCESS;
+}
+
+/*
+ * Handle set attribute on a NHG member.
+ *
+ * The key use case is HW FRR STANDBY pointer swap: when the active sister mask
+ * changes, evpnmhorch calls set_next_hop_group_member_attribute() to change
+ * the STANDBY member's NEXT_HOP_ID from one HW_PROTECTION NHG to another.
+ *
+ * We need to:
+ * 1. Update the in-memory object store (via set_internal)
+ * 2. Find the parent NHG (PROTECTION type)
+ * 3. Find all routes using that NHG
+ * 4. Reprogram each route (remove + add) with the new expanded member set
+ */
+sai_status_t
+SwitchVpp::setNexthopGroupMember(
+        _In_ const std::string &serializedObjectId,
+        _In_ const sai_attribute_t* attr)
+{
+    SWSS_LOG_ENTER();
+
+    /* Find the existing member object */
+    auto nhg_mbr_obj = get_sai_object(SAI_OBJECT_TYPE_NEXT_HOP_GROUP_MEMBER, serializedObjectId);
+    if (!nhg_mbr_obj) {
+        SWSS_LOG_ERROR("setNexthopGroupMember: member not found: %s", serializedObjectId.c_str());
+        return SAI_STATUS_FAILURE;
+    }
+
+    /* Get the parent NHG */
+    sai_attribute_t nhg_attr;
+    nhg_attr.id = SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_GROUP_ID;
+    CHECK_STATUS_QUIET(nhg_mbr_obj->get_mandatory_attr(nhg_attr));
+    sai_object_id_t nhg_oid = nhg_attr.value.oid;
+
+    auto nhg_obj = nhg_mbr_obj->get_linked_object(
+        SAI_OBJECT_TYPE_NEXT_HOP_GROUP, SAI_NEXT_HOP_GROUP_MEMBER_ATTR_NEXT_HOP_GROUP_ID);
+
+    /* Update the in-memory store first */
+    auto status = set_internal(SAI_OBJECT_TYPE_NEXT_HOP_GROUP_MEMBER, serializedObjectId, attr);
+    if (status != SAI_STATUS_SUCCESS) {
+        SWSS_LOG_ERROR("setNexthopGroupMember: set_internal failed for %s", serializedObjectId.c_str());
+        return status;
+    }
+
+    if (nhg_obj == nullptr) {
+        SWSS_LOG_WARN("setNexthopGroupMember: parent NHG not found for member %s", serializedObjectId.c_str());
+        return SAI_STATUS_SUCCESS;
+    }
+
+    SWSS_LOG_NOTICE("setNexthopGroupMember: member %s attr %d updated, parent NHG %s",
+                    serializedObjectId.c_str(), attr->id,
+                    sai_serialize_object_id(nhg_oid).c_str());
+
+    /* Find routes using this NHG and reprogram them */
+    auto routes = nhg_obj->get_child_objs(SAI_OBJECT_TYPE_ROUTE_ENTRY);
+    if (routes == nullptr || routes->empty()) {
+        SWSS_LOG_INFO("setNexthopGroupMember: no routes on NHG %s",
+                      sai_serialize_object_id(nhg_oid).c_str());
+        return SAI_STATUS_SUCCESS;
+    }
+
+    for (auto &route : *routes) {
+        SWSS_LOG_NOTICE("setNexthopGroupMember: reprogramming route %s", route.first.c_str());
+        IpRouteAddRemove(route.second.get(), false);
+        IpRouteAddRemove(route.second.get(), true);
+    }
+
     return SAI_STATUS_SUCCESS;
 }

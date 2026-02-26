@@ -32,6 +32,25 @@ sai_status_t SwitchVpp::addRemoveIpNbr(
 
     sai_deserialize_neighbor_entry(serializedObjectId, nbr_entry);
 
+    /* Check SAI_NEIGHBOR_ENTRY_ATTR_NO_HOST_ROUTE — when true, suppress
+     * the automatic /32 host route in VPP (pass no_fib_entry=true to
+     * ip4/ip6_nbr_add_del).  Used by EVPN MH HW FRR so the explicit
+     * PROTECTION NHG route owns the /32 exclusively. */
+    bool no_host_route = false;
+    for (uint32_t i = 0; i < attr_count; i++)
+    {
+        if (attr_list[i].id == SAI_NEIGHBOR_ENTRY_ATTR_NO_HOST_ROUTE)
+        {
+            no_host_route = attr_list[i].value.booldata;
+            if (no_host_route)
+            {
+                SWSS_LOG_NOTICE("Neighbor %s: NO_HOST_ROUTE=true, suppressing /32 FIB entry",
+                                serializedObjectId.c_str());
+            }
+            break;
+        }
+    }
+
     attr.id = SAI_ROUTER_INTERFACE_ATTR_TYPE;
 
     CHECK_STATUS(get(SAI_OBJECT_TYPE_ROUTER_INTERFACE, nbr_entry.rif_id, 1, &attr));
@@ -193,7 +212,7 @@ sai_status_t SwitchVpp::addRemoveIpNbr(
                     struct sockaddr_in sin;
                     sin.sin_family = AF_INET;
                     sin.sin_addr.s_addr = nbr_entry.ip_address.addr.ip4;
-                    ip4_nbr_add_del(bvi_ifname, ~0, &sin, false, false, nbr_mac, true);
+                    ip4_nbr_add_del(bvi_ifname, ~0, &sin, false, no_host_route, nbr_mac, true);
 
                     inet_ntop(AF_INET, &sin.sin_addr, ip_str, sizeof(ip_str));
                     SWSS_LOG_NOTICE("BD %d: programmed ip4 neighbor on %s for L3 hairpin "
@@ -206,7 +225,7 @@ sai_status_t SwitchVpp::addRemoveIpNbr(
                     sin6.sin6_family = AF_INET6;
                     memcpy(sin6.sin6_addr.s6_addr, nbr_entry.ip_address.addr.ip6,
                            sizeof(sin6.sin6_addr.s6_addr));
-                    ip6_nbr_add_del(bvi_ifname, ~0, &sin6, false, false, nbr_mac, true);
+                    ip6_nbr_add_del(bvi_ifname, ~0, &sin6, false, no_host_route, nbr_mac, true);
 
                     inet_ntop(AF_INET6, &sin6.sin6_addr, ip_str, sizeof(ip_str));
                     SWSS_LOG_NOTICE("BD %d: programmed ip6 neighbor on %s for L3 hairpin "
@@ -343,7 +362,7 @@ sai_status_t SwitchVpp::addRemoveIpNbr(
         sin.sin_family = AF_INET;
         sin.sin_addr.s_addr = nbr_entry.ip_address.addr.ip4;
 
-        ip4_nbr_add_del(vpp_ifname, ~0, &sin, false, false, nbr_mac, is_add);
+        ip4_nbr_add_del(vpp_ifname, ~0, &sin, false, no_host_route, nbr_mac, is_add);
 
         break;
 
@@ -353,7 +372,7 @@ sai_status_t SwitchVpp::addRemoveIpNbr(
         sin6.sin6_family = AF_INET6;
         memcpy(sin6.sin6_addr.s6_addr, nbr_entry.ip_address.addr.ip6, sizeof(sin6.sin6_addr.s6_addr));
 
-        ip6_nbr_add_del(vpp_ifname, ~0, &sin6, false, false, nbr_mac, is_add);
+        ip6_nbr_add_del(vpp_ifname, ~0, &sin6, false, no_host_route, nbr_mac, is_add);
 
         break;
     }

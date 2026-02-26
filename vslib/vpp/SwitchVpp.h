@@ -418,6 +418,10 @@ namespace saivs
                     _In_ sai_object_id_t next_hop_grp_oid,
                     _Out_ nexthop_grp_config_t **nxthop_group);
 
+            sai_status_t IpRouteNexthopGroupProtection(
+                    _In_ sai_object_id_t next_hop_grp_oid,
+                    _Out_ nexthop_grp_config_t **nxthop_group);
+
             sai_status_t IpRouteNexthopEntry(
                     _In_ sai_object_id_t next_hop_oid,
                     _Out_ nexthop_grp_config_t **nxthop_group_cfg);
@@ -439,6 +443,10 @@ namespace saivs
 
             sai_status_t removeNexthopGroupMember(
                     _In_ const std::string& serializedObjectId);
+
+            sai_status_t setNexthopGroupMember(
+                    _In_ const std::string& serializedObjectId,
+                    _In_ const sai_attribute_t* attr);
 
         protected: // VPP
 

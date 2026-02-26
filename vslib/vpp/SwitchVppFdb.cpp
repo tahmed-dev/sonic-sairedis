@@ -539,6 +539,45 @@ sai_status_t SwitchVpp::vpp_create_bvi_interface(
         }
     }
 
+    /*
+     * Bind the BVI to the correct VRF table.
+     *
+     * Without this, the BVI's connected route (e.g. 10.0.0.0/24) lands in
+     * VPP's default FIB (table 0).  Underlay traffic destined for overlay
+     * hosts then resolves via the table-0 adjacency on the BVI, entering
+     * the L2 bridge domain directly and bypassing the VRF's /32 host routes
+     * (e.g. L3 VxLAN failover routes in table 1001).  The result is L2
+     * flooding instead of L3 routed failover.
+     *
+     * The VRF is determined from the kernel's Vlan<N> interface, which
+     * intfmgrd places into Vrf-evpn before the SAI RIF is created.
+     * set_interface_vrf() must be called BEFORE any IP is configured on
+     * the BVI, because VPP moves connected routes when the table changes.
+     */
+    {
+        char vlan_ifname[32];
+        snprintf(vlan_ifname, sizeof(vlan_ifname), "Vlan%u", vlan_id);
+
+        uint32_t vrf_id = 0;
+        int ret = vpp_get_vrf_id(vlan_ifname, &vrf_id);
+        if (ret == 0 && vrf_id != 0) {
+            SWSS_LOG_NOTICE("Binding BVI %s to VRF table %u (from %s)",
+                            hw_bviifname, vrf_id, vlan_ifname);
+
+            /* Register the VRF so VPP creates the FIB table if needed */
+            auto attr_vrf_id = sai_metadata_get_attr_by_id(
+                SAI_ROUTER_INTERFACE_ATTR_VIRTUAL_ROUTER_ID, attr_count, attr_list);
+            if (attr_vrf_id) {
+                vpp_add_ip_vrf(attr_vrf_id->value.oid, vrf_id);
+            }
+
+            set_interface_vrf(hw_bviifname, 0, vrf_id, false);
+        } else {
+            SWSS_LOG_NOTICE("BVI %s: no VRF on %s (vrf_id=%u, ret=%d), staying in table 0",
+                            hw_bviifname, vlan_ifname, vrf_id, ret);
+        }
+    }
+
     return SAI_STATUS_SUCCESS;
 }
 

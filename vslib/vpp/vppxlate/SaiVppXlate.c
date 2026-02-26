@@ -2215,7 +2215,7 @@ int ip_route_add_del (vpp_ip_route_t *prefix, bool is_add)
         fib_path->table_id = 0;
         fib_path->rpf_id = htonl((uint32_t)~0);
         fib_path->weight = nexthop->weight;
-        fib_path->preference = nexthop->preference;
+        fib_path->preference = nexthop->preference;  /* 0=primary, 1+=backup (HW FRR) */
         fib_path->n_labels = 0;
     }
     ip_route->table_id = htonl(prefix->vrf_id);
@@ -4022,6 +4022,12 @@ const char * vpp_get_swif_name (const u32 swif_idx)
 {
     vat_main_t *vam = &vat_main;
     return get_swif_name(vam, swif_idx);
+}
+
+u32 vpp_get_swif_idx (const char *ifname)
+{
+    vat_main_t *vam = &vat_main;
+    return get_swif_idx(vam, ifname);
 }
 
 
