@@ -1563,10 +1563,26 @@ sai_status_t SwitchVpp::set_internal(
 
     /*
      * When proxy_arp is enabled on a VLAN interface, intfsorch sets the
-     * broadcast/multicast flood control type to NONE.  In VPP, this maps
-     * to enabling arp-ufwd on the bridge domain so that ARP requests for
-     * unknown IPs are forwarded (flooded/punted) instead of silently dropped
-     * by ARP termination.
+     * broadcast/multicast flood control type to NONE.  On a real ASIC this
+     * suppresses ARP broadcast flooding — ARP requests are trapped to CPU
+     * and the switch proxy-replies with its SVI MAC for known hosts.
+     *
+     * In VPP, ARP termination (BD flag ARP-TERM, set in SwitchVppFdb.cpp)
+     * handles this: ARP requests for IPs in the BD's ip-mac table get
+     * proxy-replied directly by VPP, and ARPs for unknown IPs are dropped.
+     * This is functionally equivalent to ASIC behavior where unknown ARP
+     * targets are trapped to CPU but receive no response.
+     *
+     * We do NOT disable VPP's BD FLOOD flag here because VPP's FLOOD flag
+     * controls both broadcast AND multicast together.  SAI's attribute is
+     * broadcast-only; disabling FLOOD would also suppress legitimate
+     * multicast traffic.  Since ARP-TERM already handles all ARP
+     * suppression, leaving FLOOD enabled has no adverse effect on ARP.
+     *
+     * We also do NOT enable arp-ufwd.  The l2-uu-fwd node requires a valid
+     * uu_fwd_sw_if_index on the BD, and VPP does not allow the same
+     * interface to be both BVI and UU_FWD.  With ARP-TERM active, all
+     * known-host ARPs are handled; unknown ARPs are correctly dropped.
      */
     if (objectType == SAI_OBJECT_TYPE_VLAN &&
         (attr->id == SAI_VLAN_ATTR_BROADCAST_FLOOD_CONTROL_TYPE ||
@@ -1592,8 +1608,8 @@ sai_status_t SwitchVpp::set_internal(
              * and proxy-replies to ARPs whose target IP is in the BD's
              * arp-term table — no flooding required for those.
              */
-            SWSS_LOG_NOTICE("VLAN %u: skipping arp-ufwd (flood_control=%d) — "
-                            "no UU forward interface configured",
+            SWSS_LOG_NOTICE("VLAN %u: flood_control=%d — ARP-TERM handles proxy ARP; "
+                            "BD FLOOD left enabled (broadcast+multicast coupled in VPP)",
                             vlan_id, attr->value.s32);
         }
     }
