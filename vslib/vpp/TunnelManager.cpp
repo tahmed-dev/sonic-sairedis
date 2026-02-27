@@ -55,6 +55,72 @@ TunnelManager::set_vxlan_port(const sai_attribute_t* attr)
 
     m_vxlan_port = attr->value.u16;
 }
+
+bool
+TunnelManager::get_overlay_bvi_mac(_Out_ uint8_t mac[6]) const
+{
+    SWSS_LOG_ENTER();
+
+    /*
+     * Scan all ROUTER_INTERFACE objects for a VLAN-type RIF that has
+     * SAI_ROUTER_INTERFACE_ATTR_SRC_MAC_ADDRESS set (the anycast gateway MAC).
+     * This MAC is used as the inner destination Ethernet address in L3 VxLAN
+     * encapsulation so that on decap the remote BVI's l2_to_bvi_dmac_check()
+     * matches and delivers the frame to L3 routing.
+     *
+     * In EVPN MH, all T1 switches share the same anycast MAC on their overlay
+     * BVI, so any VLAN RIF's SRC_MAC will do.
+     */
+    auto obj_it = m_switch_db->m_objectHash.find(SAI_OBJECT_TYPE_ROUTER_INTERFACE);
+    if (obj_it != m_switch_db->m_objectHash.end())
+    {
+        for (auto& pair : obj_it->second)
+        {
+            auto& attrs = pair.second;
+
+            /* Check if this is a VLAN-type RIF */
+            auto type_it = attrs.find("SAI_ROUTER_INTERFACE_ATTR_TYPE");
+            if (type_it == attrs.end())
+                continue;
+
+            const sai_attribute_t* type_attr = type_it->second->getAttr();
+            if (type_attr->value.s32 != SAI_ROUTER_INTERFACE_TYPE_VLAN)
+                continue;
+
+            /* Look for SRC_MAC_ADDRESS */
+            auto mac_it = attrs.find("SAI_ROUTER_INTERFACE_ATTR_SRC_MAC_ADDRESS");
+            if (mac_it == attrs.end())
+                continue;
+
+            const sai_attribute_t* mac_attr = mac_it->second->getAttr();
+
+            /* Verify non-zero */
+            bool all_zero = true;
+            for (int i = 0; i < 6; i++)
+            {
+                if (mac_attr->value.mac[i] != 0) { all_zero = false; break; }
+            }
+            if (all_zero)
+                continue;
+
+            memcpy(mac, mac_attr->value.mac, 6);
+            SWSS_LOG_NOTICE("get_overlay_bvi_mac: found anycast MAC "
+                             "%02x:%02x:%02x:%02x:%02x:%02x from VLAN RIF %s",
+                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                             pair.first.c_str());
+            return true;
+        }
+    }
+
+    /* Fallback to default router MAC */
+    auto& rm = get_router_mac();
+    memcpy(mac, rm.data(), 6);
+    SWSS_LOG_NOTICE("get_overlay_bvi_mac: no anycast MAC found, using router MAC "
+                     "%02x:%02x:%02x:%02x:%02x:%02x",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return false;
+}
+
 /**
  * VxLAN tunnel is created in response to the creation of a tunnel encap nexthop entry. This assumes VxLAN tunnel is bidirectional and symmetric.
  * The local VTEP sends packet through the tunnel to the remote VTEP. The remote VTEP sends packet back to the local VTEP through the same tunnel with the same VNI.
@@ -316,8 +382,19 @@ TunnelManager::create_vpp_vxlan_encap(
     u_int32_t                   sw_if_index;
     char                        src_ip_str[INET6_ADDRSTRLEN];
     char                        dst_ip_str[INET6_ADDRSTRLEN];
-    auto                        router_mac = get_router_mac();
-    auto                        bvi_mac = router_mac.data();
+
+    /*
+     * Use the overlay BVI MAC (anycast gateway MAC) for the inner Ethernet
+     * dst MAC in VxLAN encapsulation.  On decap, the remote VPP's
+     * l2_to_bvi_dmac_check() must match this MAC against the BVI's hw_address
+     * to deliver the frame to L3 routing.
+     *
+     * Previously this used m_router_mac (default 00:00:00:00:00:01), which
+     * never matched the BVI's anycast MAC, causing "BVI L3 mac mismatch"
+     * drops in l2-flood for all L3 VxLAN failover traffic.
+     */
+    uint8_t                     inner_dst_mac[6];
+    get_overlay_bvi_mac(inner_dst_mac);
 
     vpp_status = vpp_vxlan_tunnel_add_del(&req, 1, &sw_if_index);
     vpp_ip_addr_t_to_string(&req.src_address, src_ip_str, INET6_ADDRSTRLEN);
@@ -355,11 +432,14 @@ TunnelManager::create_vpp_vxlan_encap(
     tunnel_data.sw_if_index = sw_if_index;
     /* the neighbour is to build inner ether. use no_fib_entry to avoid creating the nh in the fib, which will mess up underlay forwarding*/
     if (req.dst_address.sa_family == AF_INET6) {
-        ip6_nbr_add_del(NULL, sw_if_index, &req.dst_address.addr.ip6, false, true/*no_fib_entry*/, bvi_mac, 1);
+        ip6_nbr_add_del(NULL, sw_if_index, &req.dst_address.addr.ip6, false, true/*no_fib_entry*/, inner_dst_mac, 1);
     } else {
-        ip4_nbr_add_del(NULL, sw_if_index, &req.dst_address.addr.ip4, false, true/*no_fib_entry*/, bvi_mac, 1);
+        ip4_nbr_add_del(NULL, sw_if_index, &req.dst_address.addr.ip4, false, true/*no_fib_entry*/, inner_dst_mac, 1);
     }
-    SWSS_LOG_INFO("successfully created encap for vxlan tunnel %d", sw_if_index);
+    SWSS_LOG_NOTICE("created encap for vxlan tunnel %d, inner dst MAC %02x:%02x:%02x:%02x:%02x:%02x",
+                     sw_if_index,
+                     inner_dst_mac[0], inner_dst_mac[1], inner_dst_mac[2],
+                     inner_dst_mac[3], inner_dst_mac[4], inner_dst_mac[5]);
     return SAI_STATUS_SUCCESS;
 }
 
@@ -374,13 +454,15 @@ TunnelManager::remove_vpp_vxlan_encap(
     u_int32_t                   sw_if_index = tunnel_data.sw_if_index;
     char                        src_ip_str[INET6_ADDRSTRLEN];
     char                        dst_ip_str[INET6_ADDRSTRLEN];
-    auto                        router_mac = get_router_mac();
-    auto                        bvi_mac = router_mac.data();
+
+    /* Use the same overlay BVI MAC that was used at encap creation time */
+    uint8_t                     inner_dst_mac[6];
+    get_overlay_bvi_mac(inner_dst_mac);
 
     if (req.dst_address.sa_family == AF_INET6) {
-        ip6_nbr_add_del(NULL, tunnel_data.sw_if_index, &req.dst_address.addr.ip6, false, true/*no_fib_entry*/, bvi_mac, 0);
+        ip6_nbr_add_del(NULL, tunnel_data.sw_if_index, &req.dst_address.addr.ip6, false, true/*no_fib_entry*/, inner_dst_mac, 0);
     } else {
-        ip4_nbr_add_del(NULL, tunnel_data.sw_if_index, &req.dst_address.addr.ip4, false, true/*no_fib_entry*/, bvi_mac, 0);
+        ip4_nbr_add_del(NULL, tunnel_data.sw_if_index, &req.dst_address.addr.ip4, false, true/*no_fib_entry*/, inner_dst_mac, 0);
     }
 
     /* Don't delete the VxLAN tunnel if it's a shared L3 tunnel created at
@@ -910,14 +992,16 @@ TunnelManager::create_l3_vxlan_tunnel(
         return SAI_STATUS_FAILURE;
     }
 
-    // Add static neighbor for inner Ethernet header (same pattern as L2)
-    auto router_mac = get_router_mac();
-    auto bvi_mac = router_mac.data();
+    // Add static neighbor for inner Ethernet header.
+    // Use the overlay BVI MAC (anycast gateway MAC) so that on decap the
+    // remote BVI's l2_to_bvi_dmac_check() accepts the inner frame.
+    uint8_t inner_dst_mac[6];
+    get_overlay_bvi_mac(inner_dst_mac);
     vpp_ip_addr_t dst_vpp;
     sai_ip_address_t dst_copy = dst;
     sai_ip_address_t_to_vpp_ip_addr_t(dst_copy, dst_vpp);
     ip4_nbr_add_del(NULL, sw_if_index, &dst_vpp.addr.ip4,
-                     false, true/*no_fib_entry*/, bvi_mac, 1);
+                     false, true/*no_fib_entry*/, inner_dst_mac, 1);
 
     L3TunnelVPPData data;
     data.sw_if_index = sw_if_index;
@@ -980,13 +1064,13 @@ TunnelManager::remove_l3_vxlan_tunnel(
 
     L3TunnelVPPData& data = it->second;
 
-    // Remove static neighbor
-    auto router_mac = get_router_mac();
-    auto bvi_mac = router_mac.data();
+    // Remove static neighbor — use same overlay BVI MAC as creation
+    uint8_t inner_dst_mac[6];
+    get_overlay_bvi_mac(inner_dst_mac);
     vpp_ip_addr_t dst_vpp;
     sai_ip_address_t_to_vpp_ip_addr_t(data.dst_ip, dst_vpp);
     ip4_nbr_add_del(NULL, data.sw_if_index, &dst_vpp.addr.ip4,
-                     false, true/*no_fib_entry*/, bvi_mac, 0);
+                     false, true/*no_fib_entry*/, inner_dst_mac, 0);
 
     int ret = vpp_l3_vxlan_tunnel_del(
         data.sw_if_index, data.src_ip.addr.ip4, data.dst_ip.addr.ip4, data.vni);

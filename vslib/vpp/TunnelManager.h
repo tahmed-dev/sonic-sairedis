@@ -232,6 +232,20 @@ namespace saivs
                         _In_ Action action);
 
         /**
+         * @brief Get the overlay BVI MAC (anycast gateway MAC) for VxLAN inner
+         *        Ethernet header.
+         *
+         * Scans VLAN-type RIFs for SAI_ROUTER_INTERFACE_ATTR_SRC_MAC_ADDRESS.
+         * This MAC is used as the inner dst MAC in L3 VxLAN encapsulation so
+         * that on decap the remote BVI's l2_to_bvi_dmac_check() accepts the
+         * frame.  Falls back to m_router_mac if no anycast MAC is found.
+         *
+         * @param[out] mac  6-byte MAC address to fill.
+         * @return true if anycast MAC found, false if using fallback.
+         */
+        bool get_overlay_bvi_mac(_Out_ uint8_t mac[6]) const;
+
+        /**
          * @brief Find an existing VxLAN tunnel in m_l3_tunnel_map matching src/dst/VNI.
          * @return pair<true, sw_if_index> if found, pair<false, 0> otherwise.
          */
