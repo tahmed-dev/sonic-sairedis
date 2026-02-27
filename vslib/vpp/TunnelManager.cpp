@@ -10,6 +10,8 @@
 
 #include "vppxlate/SaiVppXlate.h"
 
+#include <arpa/inet.h>
+
 using namespace saivs;
 
 #define CHECK_STATUS_W_MSG(status, msg, ...) {                                  \
@@ -696,6 +698,77 @@ TunnelManager::create_l2_vxlan_tunnel(
     SWSS_LOG_NOTICE("Created L2 VXLAN: tunnel=%s src=%s dst=%s VNI=%u VLAN=%u sw_if=%u",
         sai_serialize_object_id(tunnel_oid).c_str(), src_str, dst_str, vni, vlan_id, sw_if_index);
 
+    /*
+     * Place any L3 VxLAN tunnel with the same src/dst VTEP pair into this
+     * overlay BD (with SHG=1).
+     *
+     * L3 tunnels are created VRF-bound for encap, but VPP's VxLAN decap
+     * defaults to l2-input.  Without explicit BD placement the L3 tunnel
+     * ends up in an auto-assigned BD (e.g. 4096) and decapped packets
+     * can't reach the overlay BVI — causing "BVI L3 mac mismatch" drops.
+     *
+     * Placing the L3 tunnel in the same BD as the L2 tunnel allows
+     * decapped failover traffic to reach bvi<N> for L3 routing to the
+     * local server.  SHG=1 prevents BUM flooding issues.
+     *
+     * Note: learning is NOT disabled (VPP l2_flags API bug causes SIGSEGV).
+     * SHG=1 is sufficient — BUM doesn't cross between tunnel ports, and
+     * L3 tunnel traffic is rare (only during failover).
+     */
+    if (vlan_id != 0)
+    {
+        for (auto& l3_pair : m_l3_tunnel_map)
+        {
+            auto& l3_data = l3_pair.second;
+
+            /* Match by src/dst VTEP IPs (L3 and L2 tunnels share the same
+             * VTEP pair but use different VNIs) */
+            bool src_match = false, dst_match = false;
+
+            if (src_ip.addr_family == l3_data.src_ip.addr_family)
+            {
+                if (src_ip.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
+                {
+                    src_match = (memcmp(&src_ip.addr.ip4,
+                                        &l3_data.src_ip.addr.ip4, 4) == 0);
+                    dst_match = (memcmp(&dst_ip.addr.ip4,
+                                        &l3_data.dst_ip.addr.ip4, 4) == 0);
+                }
+                else
+                {
+                    src_match = (memcmp(&src_ip.addr.ip6,
+                                        &l3_data.src_ip.addr.ip6, 16) == 0);
+                    dst_match = (memcmp(&dst_ip.addr.ip6,
+                                        &l3_data.dst_ip.addr.ip6, 16) == 0);
+                }
+            }
+
+            if (src_match && dst_match)
+            {
+                const uint32_t l3_shg = 1;
+                int l3_status = set_sw_interface_l2_bridge_by_index_with_shg(
+                    l3_data.sw_if_index, vlan_id, true,
+                    VPP_API_PORT_TYPE_NORMAL, l3_shg);
+
+                if (l3_status == 0)
+                {
+                    SWSS_LOG_NOTICE("Placed L3 tunnel sw_if %u (VNI=%u) "
+                                    "into BD %u with SHG=%u for decap path",
+                                    l3_data.sw_if_index, l3_data.vni,
+                                    vlan_id, l3_shg);
+                }
+                else
+                {
+                    SWSS_LOG_ERROR("Failed to place L3 tunnel sw_if %u "
+                                   "into BD %u (status=%d)",
+                                   l3_data.sw_if_index, vlan_id, l3_status);
+                }
+                /* Only one L3 tunnel per src/dst pair */
+                break;
+            }
+        }
+    }
+
     return SAI_STATUS_SUCCESS;
 }
 
@@ -790,9 +863,46 @@ TunnelManager::create_l3_vxlan_tunnel(
         src.addr.ip4, dst.addr.ip4, vni, vrf_id, &sw_if_index);
 
     if (ret != 0) {
-        SWSS_LOG_ERROR("Failed to create L3 VxLAN tunnel: VNI=%u VRF=%u ret=%d",
-            vni, vrf_id, ret);
-        return SAI_STATUS_FAILURE;
+        /*
+         * Tunnel may already exist in VPP from a previous boot cycle
+         * (syncd restart doesn't destroy VPP tunnels).  Query VPP
+         * directly via vppctl to find the existing tunnel's sw_if_index.
+         *
+         * We can't use find_existing_vxlan_tunnel() here because
+         * m_l3_tunnel_map is empty after syncd restart — the tunnel
+         * exists in VPP but not in our in-memory map.
+         */
+        char src_str[INET_ADDRSTRLEN], dst_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &src.addr.ip4, src_str, sizeof(src_str));
+        inet_ntop(AF_INET, &dst.addr.ip4, dst_str, sizeof(dst_str));
+
+        /* Parse `vppctl show vxlan tunnel` output to find matching tunnel */
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd),
+                 "vppctl show vxlan tunnel 2>/dev/null | "
+                 "grep 'src %s dst %s.*vni %u' | "
+                 "head -1 | sed 's/.*sw-if-idx //' | awk '{print $1}'",
+                 src_str, dst_str, vni);
+        FILE *fp = popen(cmd, "r");
+        if (fp) {
+            char buf[32];
+            if (fgets(buf, sizeof(buf), fp)) {
+                sw_if_index = (uint32_t)atoi(buf);
+            }
+            pclose(fp);
+        }
+
+        if (sw_if_index > 0) {
+            SWSS_LOG_NOTICE("L3 VxLAN tunnel already exists in VPP: "
+                            "VNI=%u VRF=%u sw_if=%u src=%s dst=%s (reusing)",
+                            vni, vrf_id, sw_if_index, src_str, dst_str);
+            /* VRF binding persists from previous boot — no need to re-bind */
+        } else {
+            SWSS_LOG_ERROR("Failed to create L3 VxLAN tunnel: VNI=%u VRF=%u "
+                           "ret=%d (and no existing tunnel found in VPP)",
+                           vni, vrf_id, ret);
+            return SAI_STATUS_FAILURE;
+        }
     }
 
     if (sw_if_index == 0) {
@@ -821,6 +931,36 @@ TunnelManager::create_l3_vxlan_tunnel(
 
     SWSS_LOG_NOTICE("Created L3 VxLAN: tunnel=%s VNI=%u VRF=%u sw_if=%u",
         sai_serialize_object_id(tunnel_oid).c_str(), vni, vrf_id, sw_if_index);
+
+    /*
+     * Add a default deag (re-lookup) route in the overlay VRF so that
+     * VxLAN tunnel encap can resolve remote VTEP IPs through the underlay.
+     *
+     * Without this, the overlay VRF (table 1001) has no route to the
+     * remote VTEP loopback IPs, and VPP drops encapsulated packets.
+     * The deag route causes VPP to re-lookup in the underlay table (0)
+     * where BGP-learned routes to remote VTEPs exist.
+     *
+     * Skip for VRF 0 (underlay itself) to avoid recursive loops.
+     */
+    if (vrf_id != 0)
+    {
+        char deag_cmd[128];
+        snprintf(deag_cmd, sizeof(deag_cmd),
+                 "vppctl ip route add 0.0.0.0/0 table %u via ip4-lookup-in-table 0",
+                 vrf_id);
+        int deag_ret = system(deag_cmd);
+        if (deag_ret == 0)
+        {
+            SWSS_LOG_NOTICE("L3 VxLAN: added default deag route in VRF %u → table 0",
+                            vrf_id);
+        }
+        else
+        {
+            SWSS_LOG_WARN("L3 VxLAN: failed to add deag route in VRF %u (ret=%d)",
+                          vrf_id, deag_ret);
+        }
+    }
 
     return SAI_STATUS_SUCCESS;
 }
