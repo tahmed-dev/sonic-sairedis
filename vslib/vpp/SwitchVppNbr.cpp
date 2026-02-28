@@ -266,6 +266,29 @@ sai_status_t SwitchVpp::addRemoveIpNbr(
                                       "on %s (%s -> %s)", bd_id, host_ifname,
                                       ip_str, mac_str);
                     }
+
+                    /*
+                     * Also program the neighbor on Vlan<N> (SONiC SVI) so
+                     * FRR's zebra can see it and advertise EVPN Type-2 MAC/IP
+                     * routes.  FRR watches Vlan<N> (not bvivlan<N>) for EVPN
+                     * neighbor state.
+                     */
+                    char svi_ifname[32];
+                    snprintf(svi_ifname, sizeof(svi_ifname), "Vlan%u", bd_id);
+
+                    snprintf(cmd, sizeof(cmd),
+                             "ip neigh replace %s lladdr %s dev %s nud reachable",
+                             ip_str, mac_str, svi_ifname);
+
+                    if (system(cmd) == 0) {
+                        SWSS_LOG_NOTICE("BD %d: programmed kernel neighbor on %s "
+                                        "(%s -> %s) for FRR EVPN Type-2 MAC/IP",
+                                        bd_id, svi_ifname, ip_str, mac_str);
+                    } else {
+                        SWSS_LOG_WARN("BD %d: failed to program kernel neighbor "
+                                      "on %s (%s -> %s)", bd_id, svi_ifname,
+                                      ip_str, mac_str);
+                    }
                 }
             }
         }
