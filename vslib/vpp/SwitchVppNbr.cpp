@@ -239,13 +239,13 @@ sai_status_t SwitchVpp::addRemoveIpNbr(
                  * (bvivlan<N>) with the host's REAL MAC.  Without this,
                  * kernel-originated traffic (e.g., ICMP echo replies to the
                  * BVI's own IP) would ARP on bvivlan<N> — but VPP's arp-term
-                 * intercepts the ARP and replies with the SVI MAC.  When
-                 * kernel uses SVI MAC as dst, VPP's l2-fwd sees it as the
-                 * BVI's own MAC → reflection drop.
+                 * intercepts the ARP and replies with the SVI MAC.
                  *
-                 * With this static entry, the kernel uses the real host MAC
-                 * directly, so the frame goes through l2-fwd to the correct
-                 * bridge port (BondEthernet) instead of back to the BVI.
+                 * v2.0 NOTE: With ARP suppression, FRR populates the kernel
+                 * neighbor table from EVPN Type-2 routes. This bvivlan entry
+                 * is still useful for kernel-originated replies to the BVI's
+                 * own IP. The Vlan<N> entry below is now redundant with
+                 * neigh_suppress but kept for belt-and-suspenders.
                  */
                 if (ip_str[0] != '\0')
                 {

@@ -1077,6 +1077,13 @@ sai_status_t SwitchVpp::create(
         SWSS_LOG_INFO("L2 VXLAN tunnel create for %s: status=%d sw_if_index=%u",
             serializedObjectId.c_str(), status, sw_if_index);
 
+        /*
+         * Retry any es-protect standby configs that failed at boot because
+         * the VxLAN tunnel didn't exist yet. Now that a tunnel is created,
+         * the peer VTEP IP may resolve to this tunnel.
+         */
+        retryPendingEsProtectStandby();
+
         // If L3 succeeded but L2 failed (e.g. no VLAN mapper), that's OK
         if (l3_attempted && status != SAI_STATUS_SUCCESS) {
             SWSS_LOG_NOTICE("L2 tunnel path failed but L3 path succeeded, continuing");

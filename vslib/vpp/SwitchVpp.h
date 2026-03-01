@@ -983,6 +983,21 @@ namespace saivs
 
             TunnelManagerSRv6 m_tunnel_mgr_srv6;
 
+        protected: // VPP - ES Protect (EVPN MH v2.0)
+
+            bool shouldCreateEsProtect(const std::string &hwifname);
+
+            sai_status_t createEsProtectForBond(
+                    const std::string &bond_ifname,
+                    uint32_t bd_id,
+                    std::string &ep_ifname_out);
+
+            sai_status_t updateEsProtectStandby(
+                    const std::string &bond_ifname,
+                    const std::string &remote_vteps_csv);
+
+            void retryPendingEsProtectStandby();
+
         protected: // switch capability related
             virtual sai_status_t queryHashNativeHashFieldListCapability(
                 _Inout_ sai_s32_list_t *enum_values_capability) override;

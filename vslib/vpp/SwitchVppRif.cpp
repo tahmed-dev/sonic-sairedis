@@ -618,22 +618,30 @@ sai_status_t SwitchVpp::UpdatePort(
         }
     }
 
-    if (is_ip_nbr_active() == false) {
-        return SAI_STATUS_SUCCESS;
-    }
-
+    /*
+     * Port admin state and MTU are L1/L2 operations — always program them
+     * in VPP regardless of NO_LINUX_NL (which gates L3/neighbor ops only).
+     */
     attr_type = sai_metadata_get_attr_by_id(SAI_PORT_ATTR_ADMIN_STATE, attr_count, attr_list);
 
     if (attr_type != NULL)
     {
-        vpp_set_interface_state(object_id, 0, attr_type->value.booldata);
+        std::string ifname;
+        if (vpp_get_hwif_name(object_id, 0, ifname)) {
+            interface_set_state(ifname.c_str(), attr_type->value.booldata);
+            SWSS_LOG_NOTICE("Port admin state %s %s", ifname.c_str(),
+                            (attr_type->value.booldata ? "UP" : "DOWN"));
+        }
     }
 
     attr_type = sai_metadata_get_attr_by_id(SAI_PORT_ATTR_MTU, attr_count, attr_list);
 
     if (attr_type != NULL)
     {
-        vpp_set_port_mtu(object_id, 0, attr_type->value.u32);
+        std::string ifname;
+        if (vpp_get_hwif_name(object_id, 0, ifname)) {
+            hw_interface_set_mtu(ifname.c_str(), attr_type->value.u32);
+        }
     }
 
     return SAI_STATUS_SUCCESS;

@@ -184,8 +184,33 @@ sai_status_t SwitchVpp::vpp_create_vlan_member(
     {
         hw_ifname = hwifname;
 
-        //Create bridge and set the l2 port
-        set_sw_interface_l2_bridge(hw_ifname,bridge_id, true, VPP_API_PORT_TYPE_NORMAL);
+        /*
+         * EVPN MH v2.0: If this is an ES-protected LAG, create an es-protect
+         * virtual interface and add that to the BD instead of the raw bond.
+         * The es-protect interface handles primary/standby failover in VPP.
+         */
+        if (obj_type == SAI_OBJECT_TYPE_LAG && shouldCreateEsProtect(hw_ifname))
+        {
+            std::string ep_ifname;
+            sai_status_t ep_status = createEsProtectForBond(hw_ifname, bridge_id, ep_ifname);
+            if (ep_status == SAI_STATUS_SUCCESS && !ep_ifname.empty())
+            {
+                SWSS_LOG_NOTICE("ES-Protect: adding %s to BD %u instead of %s",
+                                ep_ifname.c_str(), bridge_id, hw_ifname);
+                set_sw_interface_l2_bridge(ep_ifname.c_str(), bridge_id, true, VPP_API_PORT_TYPE_NORMAL);
+            }
+            else
+            {
+                SWSS_LOG_WARN("ES-Protect: failed to create for %s, falling back to direct BD add",
+                              hw_ifname);
+                set_sw_interface_l2_bridge(hw_ifname, bridge_id, true, VPP_API_PORT_TYPE_NORMAL);
+            }
+        }
+        else
+        {
+            //Create bridge and set the l2 port
+            set_sw_interface_l2_bridge(hw_ifname,bridge_id, true, VPP_API_PORT_TYPE_NORMAL);
+        }
 
         /*
          * Do NOT set VTR (VLAN Tag Rewrite) for untagged access ports.
