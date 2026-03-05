@@ -493,33 +493,17 @@ sai_status_t SwitchVpp::asyncIntfStateUpdate(const char *hwif_name, bool link_up
 {
     SWSS_LOG_ENTER();
 
-    /* Bond interfaces (BondEthernet<N>) are not in sonic_vpp_ifmap.ini,
-     * so hwif_to_tap_name() cannot resolve them.  Resolve the LAG OID
-     * directly from m_lag_bond_map by matching the VPP sw_if_index. */
+    /* Bond interfaces (BondEthernet<N>) map to LAGs (PortChannels).
+     * On real ASICs, LAG oper status is driven by teamsyncd via APP_DB
+     * LAG_TABLE, not by SAI port state notifications.  To match ASIC
+     * behavior, do NOT send SAI notifications for bond state changes.
+     * Let the existing teamsyncd → orchagent path be the sole authority
+     * for LAG oper status.  Just log for diagnostics. */
     if (strncmp(hwif_name, "BondEthernet", 12) == 0)
     {
-        uint32_t bond_swif = vpp_get_swif_idx(hwif_name);
-        std::lock_guard<std::mutex> lock(LagMapMutex);
-
-        for (auto &kv : m_lag_bond_map)
-        {
-            if (kv.second.sw_if_index == bond_swif)
-            {
-                auto state = link_up ? SAI_PORT_OPER_STATUS_UP
-                                     : SAI_PORT_OPER_STATUS_DOWN;
-
-                SWSS_LOG_NOTICE("EVPN MH bond state event: %s (LAG %s) → %s",
-                    hwif_name,
-                    sai_serialize_object_id(kv.first).c_str(),
-                    link_up ? "UP" : "DOWN");
-
-                send_port_oper_status_notification(kv.first, state, false);
-                return SAI_STATUS_SUCCESS;
-            }
-        }
-
-        SWSS_LOG_NOTICE("Bond %s (sw_if=%u) not found in m_lag_bond_map",
-            hwif_name, bond_swif);
+        SWSS_LOG_NOTICE("Bond state event: %s → %s (not sending SAI notification, "
+            "LAG oper status driven by teamsyncd)",
+            hwif_name, link_up ? "UP" : "DOWN");
         return SAI_STATUS_SUCCESS;
     }
 

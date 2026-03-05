@@ -448,6 +448,19 @@ sai_status_t SwitchVpp::vpp_create_bvi_interface(
     interface_set_state(hw_ifname, true);
 
     /*
+     * Set L3 MTU on the BVI interface.  VPP defaults virtual interfaces
+     * to 9000 bytes which is lower than the SONiC default of 9100.
+     * Packets larger than the BVI MTU are silently dropped in the L2
+     * bridge output path.  Must use sw_interface_set_mtu (software MTU)
+     * because hw_interface_set_mtu fails on virtual interfaces.
+     *
+     * This must happen BEFORE the LCP TAP pair is created below so that
+     * the TAP inherits the correct MTU from the parent.
+     */
+    sw_interface_set_mtu(hw_ifname, VPP_DEFAULT_VIRTUAL_IF_MTU);
+    SWSS_LOG_NOTICE("Set BVI MTU to %u on %s", VPP_DEFAULT_VIRTUAL_IF_MTU, hw_ifname);
+
+    /*
      * Disable VTR on the BVI.  Physical untagged ports need PUSH_1 so VPP's
      * BD can distinguish VLAN membership internally, but the BVI is a routed
      * L3 interface — its LCP tap should receive untagged IP frames.  With
@@ -484,11 +497,22 @@ sai_status_t SwitchVpp::vpp_create_bvi_interface(
         SWSS_LOG_NOTICE("Creating LCP pair for BVI: %s -> %s", bvi_ifname, host_ifname);
         configure_lcp_interface(bvi_ifname, host_ifname, true);
 
-        /* Bring the LCP tap interface up */
+        /* Bring the LCP tap interface up and set MTU */
         char cmd[256];
         snprintf(cmd, sizeof(cmd), "ip link set %s up", host_ifname);
         if (system(cmd) != 0) {
             SWSS_LOG_WARN("Failed to bring up %s", host_ifname);
+        }
+
+        /*
+         * Set MTU on the BVI TAP (kernel side).  VPP LCP creates TAPs
+         * with the default 9000 MTU.  Without this, the kernel bvivlan<N>
+         * interface has MTU 9000 and drops punted packets > 9000 bytes.
+         */
+        snprintf(cmd, sizeof(cmd), "ip link set %s mtu %u",
+                 host_ifname, VPP_DEFAULT_VIRTUAL_IF_MTU);
+        if (system(cmd) != 0) {
+            SWSS_LOG_WARN("Failed to set MTU on %s", host_ifname);
         }
 
         /*
@@ -775,6 +799,19 @@ sai_status_t SwitchVpp::vpp_create_lag(
     hw_ifname = vpp_get_swif_name(swif_idx);
     SWSS_LOG_NOTICE("Setting lag hw interface state to up :%s",hw_ifname);
     interface_set_state(hw_ifname, true);
+
+    /*
+     * Set L3 MTU on the BondEthernet interface.  VPP defaults virtual
+     * interfaces to 9000 bytes which is lower than the SONiC default of
+     * 9100.  Must use sw_interface_set_mtu (software MTU) because
+     * hw_interface_set_mtu fails on virtual interfaces.
+     *
+     * This must happen BEFORE the LCP TAP pair is created (in
+     * vpp_create_lag_member) so that the TAP inherits the correct MTU.
+     */
+    sw_interface_set_mtu(hw_ifname, VPP_DEFAULT_VIRTUAL_IF_MTU);
+    SWSS_LOG_NOTICE("Set BondEthernet MTU to %u on %s", VPP_DEFAULT_VIRTUAL_IF_MTU, hw_ifname);
+
     return SAI_STATUS_SUCCESS;
 }
 
@@ -919,6 +956,21 @@ sai_status_t SwitchVpp::vpp_create_lag_member(
         const char *hw_ifname;
         hw_ifname = vpp_get_swif_name(bond_if_idx);
         configure_lcp_interface(hw_ifname, tap.c_str(), true);
+
+        /*
+         * Set MTU on the BondEthernet TAP (kernel side).  VPP LCP creates
+         * TAPs with the default 9000 MTU regardless of the parent's MTU.
+         * Without this, the kernel be<N> interface has MTU 9000 and drops
+         * packets > 9000 bytes on the punt/inject path.
+         */
+        {
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd), "ip link set %s mtu %u",
+                     tap.c_str(), VPP_DEFAULT_VIRTUAL_IF_MTU);
+            if (system(cmd) != 0) {
+                SWSS_LOG_WARN("Failed to set MTU on %s", tap.c_str());
+            }
+        }
 
         // add tc filter to redirect traffic from tap to PortChannel
         std::string portchannel = std::string("PortChannel") + std::to_string(bond_id);

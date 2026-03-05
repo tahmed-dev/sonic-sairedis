@@ -15,6 +15,21 @@ extern "C" {
 
 #define BONDETHERNET_PREFIX "BondEthernet"
 
+/*
+ * Default L3 MTU for VPP virtual interfaces (BondEthernet, BVI, TAP).
+ *
+ * VPP defaults virtual interfaces to 9000 bytes L3 MTU, but SONiC's
+ * ConfigDB PORT MTU is 9100.  Packets larger than the interface MTU are
+ * silently dropped in the L2 bridge / BVI output path.  With the default
+ * MSS negotiation (MSS = MTU - 40 = 9060), IP packets of 9100 bytes
+ * exceed the 9000-byte VPP default and get dropped.
+ *
+ * Physical ports (bobm*) are set via hw_interface_set_mtu (DPDK driver),
+ * which correctly sets L3 MTU to 9100.  Virtual interfaces don't support
+ * hw_interface_set_mtu and need sw_interface_set_mtu (software L3 MTU).
+ */
+#define VPP_DEFAULT_VIRTUAL_IF_MTU 9100
+
 #define CHECK_STATUS_W_MSG(status, msg, ...) {                                  \
     sai_status_t _status = (status);                            \
     if (_status != SAI_STATUS_SUCCESS) { \
