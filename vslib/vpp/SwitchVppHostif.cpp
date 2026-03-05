@@ -1,4 +1,5 @@
 #include "SwitchVpp.h"
+#include "SwitchVppUtils.h"
 #include "HostInterfaceInfo.h"
 #include "EventPayloadNotification.h"
 
@@ -322,6 +323,21 @@ sai_status_t SwitchVpp::vs_create_hostif_tap_interface(
     const char *hwif_name = tap_to_hwif_name(dev);
 
     configure_lcp_interface(hwif_name, dev, true);
+
+    /*
+     * Set MTU on the physical port TAP (kernel side).  VPP LCP creates
+     * TAPs with the default 9000 MTU regardless of the parent interface's
+     * MTU.  Without this, the kernel Ethernet<N> interface has MTU 9000
+     * and drops packets > 9000 bytes on the punt/inject path.
+     */
+    {
+        char mtu_cmd[256];
+        snprintf(mtu_cmd, sizeof(mtu_cmd), "ip link set %s mtu %u",
+                 dev, VPP_DEFAULT_VIRTUAL_IF_MTU);
+        if (system(mtu_cmd) != 0) {
+            SWSS_LOG_WARN("Failed to set MTU on %s", dev);
+        }
+    }
 
     {
         bool link_up = false;
