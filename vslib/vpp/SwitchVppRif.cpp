@@ -504,6 +504,40 @@ sai_status_t SwitchVpp::asyncIntfStateUpdate(const char *hwif_name, bool link_up
         SWSS_LOG_NOTICE("Bond state event: %s → %s (not sending SAI notification, "
             "LAG oper status driven by teamsyncd)",
             hwif_name, link_up ? "UP" : "DOWN");
+
+        /* EVPN MH fast path: when a bond goes DOWN (all LACP members
+         * deselected), immediately move L2 FDB entries from the dead bond
+         * to the VxLAN tunnel.  This happens at VPP dataplane speed,
+         * well before the slower teamsyncd → orchagent → fdborch path
+         * kicks in (which does the same thing via SAI, seconds later).
+         *
+         * On bond UP, do nothing — the orchagent path will naturally
+         * re-learn MACs locally via arp-term and vppPollFdb. */
+        if (!link_up)
+        {
+            /* Resolve BondEthernet<N> → SAI LAG OID */
+            sai_object_id_t lag_id = SAI_NULL_OBJECT_ID;
+            {
+                std::lock_guard<std::mutex> lock(LagMapMutex);
+                for (auto &kv : m_lag_bond_map)
+                {
+                    const char *bond_name = vpp_get_swif_name(kv.second.sw_if_index);
+                    if (bond_name && strcmp(bond_name, hwif_name) == 0)
+                    {
+                        lag_id = kv.first;
+                        break;
+                    }
+                }
+            } /* LagMapMutex released here */
+
+            if (lag_id != SAI_NULL_OBJECT_ID)
+            {
+                SWSS_LOG_NOTICE("EVPN MH fast-path: bond %s DOWN → triggering FDB failover for LAG %s",
+                        hwif_name, sai_serialize_object_id(lag_id).c_str());
+                vpp_fdb_lag_failover(lag_id);
+            }
+        }
+
         return SAI_STATUS_SUCCESS;
     }
 

@@ -955,6 +955,57 @@ namespace saivs
 
             std::map<VppFdbKey, VppFdbValue> m_vpp_fdb_cache;
 
+        private: // VPP - FDB source tracking for EVPN MH failover
+
+            /**
+             * @brief MAC learning source for EVPN MH failover.
+             *
+             * Tracks how each MAC was installed in VPP L2 FIB:
+             *   LOCAL  — programmed on a local bond (SAI FDB from fdborch or arp-term)
+             *   REMOTE — programmed on a VxLAN tunnel (EVPN Type-2 from peer T1)
+             *   BOTH   — both local and remote entries exist
+             *
+             * On LAG failover (all LACP members deselected), LOCAL/BOTH MACs
+             * on the affected bond are moved to the VxLAN tunnel for instant
+             * reroute, avoiding black-holing on a dead bond.
+             */
+            enum class FdbSource { LOCAL, REMOTE, BOTH };
+
+            struct FdbSourceInfo {
+                FdbSource source;
+                uint32_t  local_sw_if_index;   /* bond sw_if_index (when LOCAL or BOTH) */
+                uint32_t  remote_sw_if_index;  /* tunnel sw_if_index (when REMOTE or BOTH) */
+                uint32_t  bd_id;
+                bool      is_static;
+            };
+
+            std::map<VppFdbKey, FdbSourceInfo> m_fdb_source_map;
+            std::mutex m_fdb_source_mutex;
+
+            void fdbSourceTrack(
+                    _In_ const sai_mac_t &mac,
+                    _In_ uint32_t bd_id,
+                    _In_ uint32_t sw_if_index,
+                    _In_ bool is_tunnel,
+                    _In_ bool is_static);
+
+            void fdbSourceUntrack(
+                    _In_ const sai_mac_t &mac,
+                    _In_ uint32_t bd_id,
+                    _In_ bool is_tunnel);
+
+        public:
+            /**
+             * @brief Move FDB entries from a failed LAG to the VxLAN tunnel.
+             *
+             * Called when teamsyncd detects all LACP members deselected on a LAG.
+             * For each MAC that was locally learned on the LAG's bond, deletes the
+             * bond FDB entry and installs it on the VxLAN tunnel instead.
+             *
+             * @param lag_id SAI LAG object ID (the PortChannel that failed)
+             */
+            void vpp_fdb_lag_failover(_In_ sai_object_id_t lag_id);
+
         private: // VPP
 
             std::map<std::string, std::string> m_hostif_hwif_map;
