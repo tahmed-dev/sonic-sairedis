@@ -1198,6 +1198,11 @@ sai_status_t SwitchVpp::vpp_fdbentry_add(
                     fdb_entry.mac_address[0], fdb_entry.mac_address[1], fdb_entry.mac_address[2],
                     fdb_entry.mac_address[3], fdb_entry.mac_address[4], fdb_entry.mac_address[5],
                     tun_ifname, tun_sw_if_index, tun_bd_id, is_static, ret);
+
+                /* Track as REMOTE source for EVPN MH failover */
+                if (ret == 0)
+                    fdbSourceTrack(fdb_entry.mac_address, tun_bd_id, tun_sw_if_index, true /* tunnel */, is_static);
+
                 return (ret == 0) ? SAI_STATUS_SUCCESS : SAI_STATUS_FAILURE;
             }
         }
@@ -1275,6 +1280,20 @@ sai_status_t SwitchVpp::vpp_fdbentry_add(
         auto ret = l2fib_add_del(hwif_name, fdb_entry.mac_address, bd_id, is_add, is_static);
         SWSS_LOG_NOTICE("FDB Entry %s on hwif_name %s bd=%u ret_val: %d",
                 is_add ? "Added" : "Deleted", hwif_name, bd_id, ret);
+
+        /* Track as LOCAL source for EVPN MH failover */
+        if (ret == 0)
+        {
+            /* Resolve sw_if_index from hwif_name */
+            uint32_t local_swif = 0;
+            if (obj_type == SAI_OBJECT_TYPE_LAG)
+            {
+                platform_bond_info_t bi;
+                if (get_lag_bond_info(port_id, bi) == SAI_STATUS_SUCCESS)
+                    local_swif = bi.sw_if_index;
+            }
+            fdbSourceTrack(fdb_entry.mac_address, bd_id, local_swif, false /* not tunnel */, is_static);
+        }
     }
 
     return SAI_STATUS_SUCCESS;
@@ -1386,6 +1405,11 @@ sai_status_t SwitchVpp::vpp_fdbentry_del(
                     fdb_entry.mac_address[0], fdb_entry.mac_address[1], fdb_entry.mac_address[2],
                     fdb_entry.mac_address[3], fdb_entry.mac_address[4], fdb_entry.mac_address[5],
                     tun_ifname, tun_sw_if_index, tun_bd_id, ret);
+
+                /* Untrack REMOTE source */
+                if (ret == 0)
+                    fdbSourceUntrack(fdb_entry.mac_address, tun_bd_id, true /* tunnel */);
+
                 return (ret == 0) ? SAI_STATUS_SUCCESS : SAI_STATUS_FAILURE;
             }
         }
@@ -1459,6 +1483,10 @@ sai_status_t SwitchVpp::vpp_fdbentry_del(
     {
         auto ret = l2fib_add_del(hwif_name, fdb_entry.mac_address, bd_id, is_add, is_static);
         SWSS_LOG_NOTICE("Delete FDB_ENTRY on hwif_name %s bd=%u ret_val: %d", hwif_name, bd_id, ret);
+
+        /* Untrack LOCAL source */
+        if (ret == 0)
+            fdbSourceUntrack(fdb_entry.mac_address, bd_id, false /* not tunnel */);
     }
 
     return SAI_STATUS_SUCCESS;
@@ -2283,4 +2311,249 @@ void SwitchVpp::vppProcessL2MacEvent(
             }
         }
     }
+}
+
+/*
+ * FDB Source Tracking — EVPN MH failover support
+ *
+ * Every FDB entry programmed via SAI is tracked by learning source:
+ *   LOCAL  — installed on a local bond (BondEthernetN)
+ *   REMOTE — installed on a VxLAN tunnel (from EVPN Type-2 peer)
+ *   BOTH   — seen on both local bond and tunnel
+ *
+ * When a LAG loses all LACP members, vpp_fdb_lag_failover() moves
+ * LOCAL/BOTH MACs from the dead bond to the VxLAN tunnel, giving
+ * instant data-plane reroute via the EVPN MH protection path.
+ */
+
+void SwitchVpp::fdbSourceTrack(
+        _In_ const sai_mac_t &mac,
+        _In_ uint32_t bd_id,
+        _In_ uint32_t sw_if_index,
+        _In_ bool is_tunnel,
+        _In_ bool is_static)
+{
+    VppFdbKey key;
+    key.bd_id = bd_id;
+    memcpy(key.mac, mac, 6);
+
+    std::lock_guard<std::mutex> lock(m_fdb_source_mutex);
+
+    auto it = m_fdb_source_map.find(key);
+    if (it == m_fdb_source_map.end())
+    {
+        FdbSourceInfo info;
+        info.source = is_tunnel ? FdbSource::REMOTE : FdbSource::LOCAL;
+        info.local_sw_if_index = is_tunnel ? 0 : sw_if_index;
+        info.remote_sw_if_index = is_tunnel ? sw_if_index : 0;
+        info.bd_id = bd_id;
+        info.is_static = is_static;
+        m_fdb_source_map[key] = info;
+
+        SWSS_LOG_INFO("fdbSourceTrack: ADD mac=%02x:%02x:%02x:%02x:%02x:%02x bd=%u src=%s swif=%u",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                bd_id, is_tunnel ? "REMOTE" : "LOCAL", sw_if_index);
+    }
+    else
+    {
+        /* Already tracked — upgrade to BOTH if we see the other source */
+        if (is_tunnel && it->second.source == FdbSource::LOCAL)
+        {
+            it->second.source = FdbSource::BOTH;
+            it->second.remote_sw_if_index = sw_if_index;
+        }
+        else if (!is_tunnel && it->second.source == FdbSource::REMOTE)
+        {
+            it->second.source = FdbSource::BOTH;
+            it->second.local_sw_if_index = sw_if_index;
+        }
+        else if (!is_tunnel)
+        {
+            /* Update local sw_if_index (MAC move between bonds) */
+            it->second.local_sw_if_index = sw_if_index;
+        }
+        it->second.is_static = is_static;
+
+        SWSS_LOG_INFO("fdbSourceTrack: UPD mac=%02x:%02x:%02x:%02x:%02x:%02x bd=%u src=%s",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                bd_id,
+                it->second.source == FdbSource::BOTH ? "BOTH" :
+                (it->second.source == FdbSource::LOCAL ? "LOCAL" : "REMOTE"));
+    }
+}
+
+void SwitchVpp::fdbSourceUntrack(
+        _In_ const sai_mac_t &mac,
+        _In_ uint32_t bd_id,
+        _In_ bool is_tunnel)
+{
+    VppFdbKey key;
+    key.bd_id = bd_id;
+    memcpy(key.mac, mac, 6);
+
+    std::lock_guard<std::mutex> lock(m_fdb_source_mutex);
+
+    auto it = m_fdb_source_map.find(key);
+    if (it == m_fdb_source_map.end())
+        return;
+
+    if (it->second.source == FdbSource::BOTH)
+    {
+        /* Downgrade from BOTH to the remaining source */
+        if (is_tunnel)
+        {
+            it->second.source = FdbSource::LOCAL;
+            it->second.remote_sw_if_index = 0;
+        }
+        else
+        {
+            it->second.source = FdbSource::REMOTE;
+            it->second.local_sw_if_index = 0;
+        }
+        SWSS_LOG_INFO("fdbSourceUntrack: DOWNGRADE mac=%02x:%02x:%02x:%02x:%02x:%02x bd=%u → %s",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], bd_id,
+                it->second.source == FdbSource::LOCAL ? "LOCAL" : "REMOTE");
+    }
+    else
+    {
+        /* Complete removal */
+        SWSS_LOG_INFO("fdbSourceUntrack: DEL mac=%02x:%02x:%02x:%02x:%02x:%02x bd=%u",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], bd_id);
+        m_fdb_source_map.erase(it);
+    }
+}
+
+/*
+ * vpp_fdb_lag_failover — Move FDB entries from a failed LAG to VxLAN tunnel
+ *
+ * When all LACP members of a LAG are deselected (link failure / server-side
+ * shutdown), this function scans the FDB source tracker for MACs that were
+ * locally installed on the LAG's VPP bond.  For each such MAC:
+ *
+ *   1. Delete the bond entry from VPP L2 FIB
+ *   2. If a remote (tunnel) path is known → install on tunnel (instant reroute)
+ *   3. If no remote path → just delete (traffic will flood via BVI → IP
+ *      protection NHG → tunnel)
+ *
+ * The MAC source is updated from LOCAL→REMOTE (or BOTH→REMOTE) so
+ * subsequent failover calls are no-ops.  When the bond recovers, arp-term
+ * and l2-learn will naturally re-learn the MACs locally and the tracker
+ * upgrades back to LOCAL or BOTH.
+ */
+void SwitchVpp::vpp_fdb_lag_failover(
+        _In_ sai_object_id_t lag_id)
+{
+    SWSS_LOG_ENTER();
+
+    /* Resolve LAG → VPP bond sw_if_index */
+    platform_bond_info_t bond_info;
+    {
+        std::lock_guard<std::mutex> lock(LagMapMutex);
+        auto it = m_lag_bond_map.find(lag_id);
+        if (it == m_lag_bond_map.end())
+        {
+            SWSS_LOG_WARN("vpp_fdb_lag_failover: LAG %s not in bond map",
+                    sai_serialize_object_id(lag_id).c_str());
+            return;
+        }
+        bond_info = it->second;
+    }
+
+    const char *bond_name = vpp_get_swif_name(bond_info.sw_if_index);
+    SWSS_LOG_NOTICE("vpp_fdb_lag_failover: LAG %s → %s (sw_if=%u) — scanning FDB",
+            sai_serialize_object_id(lag_id).c_str(),
+            bond_name ? bond_name : "???",
+            bond_info.sw_if_index);
+
+    /* Find the VxLAN tunnel sw_if_index for this bridge domain.
+     * In EVPN MH there's typically one inter-T1 VxLAN tunnel. */
+    uint32_t tunnel_sw_if_index = 0;
+    {
+        /* Scan tunnel bridge ports to find one in the same BD */
+        auto bpIt = m_objectHash.find(SAI_OBJECT_TYPE_BRIDGE_PORT);
+        if (bpIt != m_objectHash.end())
+        {
+            for (auto &kv : bpIt->second)
+            {
+                sai_object_id_t bpId;
+                sai_deserialize_object_id(kv.first, bpId);
+
+                sai_attribute_t attr;
+                attr.id = SAI_BRIDGE_PORT_ATTR_TYPE;
+                if (get(SAI_OBJECT_TYPE_BRIDGE_PORT, bpId, 1, &attr) != SAI_STATUS_SUCCESS)
+                    continue;
+
+                if ((sai_bridge_port_type_t)attr.value.s32 != SAI_BRIDGE_PORT_TYPE_TUNNEL)
+                    continue;
+
+                attr.id = SAI_BRIDGE_PORT_ATTR_TUNNEL_ID;
+                if (get(SAI_OBJECT_TYPE_BRIDGE_PORT, bpId, 1, &attr) != SAI_STATUS_SUCCESS)
+                    continue;
+
+                uint32_t sw_if = 0;
+                uint16_t vlan = 0;
+                if (m_tunnel_mgr.getL2TunnelInfo(attr.value.oid, sw_if, vlan))
+                {
+                    tunnel_sw_if_index = sw_if;
+                    break; /* Use the first tunnel we find */
+                }
+            }
+        }
+    }
+
+    const char *tunnel_name = tunnel_sw_if_index ? vpp_get_swif_name(tunnel_sw_if_index) : nullptr;
+    SWSS_LOG_NOTICE("vpp_fdb_lag_failover: tunnel target: %s (sw_if=%u)",
+            tunnel_name ? tunnel_name : "NONE", tunnel_sw_if_index);
+
+    /* Scan FDB source map for MACs on this bond */
+    std::lock_guard<std::mutex> lock(m_fdb_source_mutex);
+
+    int moved = 0, flushed = 0;
+    for (auto &kv : m_fdb_source_map)
+    {
+        auto &info = kv.second;
+
+        /* Only process MACs that have a local component on this bond */
+        if (info.source == FdbSource::REMOTE)
+            continue;
+        if (info.local_sw_if_index != bond_info.sw_if_index)
+            continue;
+
+        /* Delete from the bond */
+        l2fib_add_del(bond_name, kv.first.mac, kv.first.bd_id, false /* is_add */, info.is_static);
+
+        if (tunnel_sw_if_index != 0 && tunnel_name != nullptr)
+        {
+            /* Install on tunnel — instant reroute */
+            l2fib_add_del(tunnel_name, kv.first.mac, kv.first.bd_id, true /* is_add */, false /* dynamic */);
+
+            SWSS_LOG_NOTICE("vpp_fdb_lag_failover: MOVE mac=%02x:%02x:%02x:%02x:%02x:%02x "
+                    "bd=%u %s → %s (was %s)",
+                    kv.first.mac[0], kv.first.mac[1], kv.first.mac[2],
+                    kv.first.mac[3], kv.first.mac[4], kv.first.mac[5],
+                    kv.first.bd_id, bond_name, tunnel_name,
+                    info.source == FdbSource::BOTH ? "BOTH" : "LOCAL");
+
+            info.source = FdbSource::REMOTE;
+            info.remote_sw_if_index = tunnel_sw_if_index;
+            info.local_sw_if_index = 0;
+            moved++;
+        }
+        else
+        {
+            /* No tunnel known — just flush, traffic will flood */
+            SWSS_LOG_NOTICE("vpp_fdb_lag_failover: FLUSH mac=%02x:%02x:%02x:%02x:%02x:%02x "
+                    "bd=%u from %s (no tunnel)",
+                    kv.first.mac[0], kv.first.mac[1], kv.first.mac[2],
+                    kv.first.mac[3], kv.first.mac[4], kv.first.mac[5],
+                    kv.first.bd_id, bond_name);
+
+            info.source = FdbSource::REMOTE;
+            info.local_sw_if_index = 0;
+            flushed++;
+        }
+    }
+
+    SWSS_LOG_NOTICE("vpp_fdb_lag_failover: LAG %s done — moved %d, flushed %d MACs",
+            sai_serialize_object_id(lag_id).c_str(), moved, flushed);
 }
