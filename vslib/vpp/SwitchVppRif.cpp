@@ -1244,13 +1244,27 @@ sai_status_t SwitchVpp::vpp_add_del_intf_ip_addr_norif (
                           is_add ? "add" : "remove", vlan_id);
         }
 
-        /* Keep IP on Vlan<N> — do NOT remove it.  FRR's zebra resolves the
-         * EVPN SVI as Vlan<N> (ZEBRA_IF_VLAN) and installs MH sync
-         * neighbors there via dplane_local_neigh_add().  The kernel rejects
-         * RTM_NEWNEIGH if the interface has no IPv4 address. */
+        /* Remove IP from Vlan<N> to prevent duplicate-IP ARP issues.
+         * When both Vlan<N> and bvivlan<N> have the same IP, the kernel
+         * responds to ARP requests with Vlan<N>'s system MAC instead of
+         * bvivlan<N>'s anycast gateway MAC — breaking overlay ARP.
+         *
+         * FRR's dplane_local_neigh_add() needs an IPv4 address on the SVI,
+         * but bvivlan<N> is the correct SVI for VPP; Vlan<N> is just the
+         * kernel's placeholder.  If FRR neighbor installs fail, we can add
+         * a link-local address to Vlan<N> instead. */
+        if (is_add) {
+            snprintf(cmd, sizeof(cmd), "ip addr del %s/%d dev Vlan%u 2>/dev/null",
+                     ip_str, prefix_len, vlan_id);
+            if (system(cmd) != 0) {
+                SWSS_LOG_DEBUG("ip addr del on Vlan%u returned non-zero (may not exist yet)", vlan_id);
+            }
+            SWSS_LOG_NOTICE("Removed IP %s/%d from Vlan%u to prevent duplicate ARP",
+                            ip_str, prefix_len, vlan_id);
+        }
 
-        SWSS_LOG_NOTICE("BVI LCP tap IP %s on bvivlan%u (also kept on Vlan%u)",
-                        is_add ? "added" : "removed", vlan_id, vlan_id);
+        SWSS_LOG_NOTICE("BVI LCP tap IP %s on bvivlan%u",
+                        is_add ? "added" : "removed", vlan_id);
     }
 
     if (ret != 0)

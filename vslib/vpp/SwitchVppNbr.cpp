@@ -212,10 +212,14 @@ sai_status_t SwitchVpp::addRemoveIpNbr(
                     struct sockaddr_in sin;
                     sin.sin_family = AF_INET;
                     sin.sin_addr.s_addr = nbr_entry.ip_address.addr.ip4;
-                    ip4_nbr_add_del(bvi_ifname, ~0, &sin, false, no_host_route, nbr_mac, true);
+                    /* is_static=true prevents VPP arp-term from overwriting
+                     * the real server MAC with the anycast gateway MAC.
+                     * arp-term learns dynamic neighbors with its own SVI MAC
+                     * for every ARP it intercepts — static wins over dynamic. */
+                    ip4_nbr_add_del(bvi_ifname, ~0, &sin, true/*is_static*/, no_host_route, nbr_mac, true);
 
                     inet_ntop(AF_INET, &sin.sin_addr, ip_str, sizeof(ip_str));
-                    SWSS_LOG_NOTICE("BD %d: programmed ip4 neighbor on %s for L3 hairpin "
+                    SWSS_LOG_NOTICE("BD %d: programmed STATIC ip4 neighbor on %s for L3 hairpin "
                                     "(real MAC %s)", bd_id, bvi_ifname, mac_str);
                     break;
                 }
@@ -225,7 +229,7 @@ sai_status_t SwitchVpp::addRemoveIpNbr(
                     sin6.sin6_family = AF_INET6;
                     memcpy(sin6.sin6_addr.s6_addr, nbr_entry.ip_address.addr.ip6,
                            sizeof(sin6.sin6_addr.s6_addr));
-                    ip6_nbr_add_del(bvi_ifname, ~0, &sin6, false, no_host_route, nbr_mac, true);
+                    ip6_nbr_add_del(bvi_ifname, ~0, &sin6, true/*is_static*/, no_host_route, nbr_mac, true);
 
                     inet_ntop(AF_INET6, &sin6.sin6_addr, ip_str, sizeof(ip_str));
                     SWSS_LOG_NOTICE("BD %d: programmed ip6 neighbor on %s for L3 hairpin "

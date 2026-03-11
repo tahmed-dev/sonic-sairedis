@@ -13,6 +13,7 @@
 
 #include <memory>
 #include <set>
+#include <arpa/inet.h>
 
 using namespace saivs;
 
@@ -560,6 +561,54 @@ sai_status_t SwitchVpp::vpp_create_bvi_interface(
                  host_ifname, host_ifname);
         if (system(cmd) != 0) {
             SWSS_LOG_WARN("Failed to disable proxy_arp on %s", host_ifname);
+        }
+    }
+
+    /*
+     * Enable ip4-unicast on the BVI interface.
+     *
+     * VPP only enables ip4 processing on an interface after an IP address
+     * is configured.  Without this, decapped VxLAN packets reaching the
+     * BVI hit "ip4-not-enabled" and are silently dropped.
+     *
+     * Use a persistent link-local /32 address (169.254.<vlan_hi>.<vlan_lo>)
+     * unique per VLAN to avoid conflicts.  The address must remain — VPP
+     * disables ip4 if the last address is removed.
+     *
+     * Note: the dummy neighbor (ip4_nbr_add_del) approach does NOT work
+     * on BVI interfaces — VPP's ip4 feature arc enable is only triggered
+     * by address add, not by neighbor add.
+     */
+    {
+        char bvi_ifname[32];
+        snprintf(bvi_ifname, sizeof(bvi_ifname), "bvi%u", vlan_id);
+
+        /* Allocate space for vpp_ip_route_t with zero nexthops */
+        vpp_ip_route_t route;
+        memset(&route, 0, sizeof(route));
+        route.prefix_addr.sa_family = AF_INET;
+        route.prefix_len = 32;
+        route.nexthop_cnt = 0;
+
+        /* 169.254.<vlan_id high byte>.<vlan_id low byte> */
+        struct sockaddr_in *addr4 = &route.prefix_addr.addr.ip4;
+        addr4->sin_family = AF_INET;
+        uint8_t *octets = (uint8_t *)&addr4->sin_addr.s_addr;
+        octets[0] = 169;
+        octets[1] = 254;
+        octets[2] = (vlan_id >> 8) & 0xFF;
+        octets[3] = vlan_id & 0xFF;
+
+        int rc = interface_ip_address_add_del(bvi_ifname, &route, true/*add*/);
+        if (rc == 0)
+        {
+            SWSS_LOG_NOTICE("Enabled ip4-unicast on %s via link-local 169.254.%u.%u/32",
+                            bvi_ifname, (vlan_id >> 8) & 0xFF, vlan_id & 0xFF);
+        }
+        else
+        {
+            SWSS_LOG_WARN("Failed to enable ip4 on %s via link-local address (rc=%d)",
+                          bvi_ifname, rc);
         }
     }
 

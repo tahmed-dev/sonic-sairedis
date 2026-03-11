@@ -11,6 +11,7 @@
 #include "vppxlate/SaiVppXlate.h"
 
 #include <arpa/inet.h>
+#include <set>
 
 using namespace saivs;
 
@@ -440,6 +441,18 @@ TunnelManager::create_vpp_vxlan_encap(
                      sw_if_index,
                      inner_dst_mac[0], inner_dst_mac[1], inner_dst_mac[2],
                      inner_dst_mac[3], inner_dst_mac[4], inner_dst_mac[5]);
+
+    /*
+     * NOTE: BD placement is deferred to create_l2_vxlan_tunnel().
+     *
+     * VPP's vxlan_add_tunnel asynchronously auto-assigns the tunnel to
+     * BD 4096 after returning.  Placing the tunnel into the correct BD
+     * here races with that async callback and loses.  Instead,
+     * create_l2_vxlan_tunnel() runs ~10-15s later (after VxLAN tunnel
+     * init completes) and moves the tunnel from BD 4096 to the correct
+     * overlay BD (e.g. 3000).
+     */
+
     return SAI_STATUS_SUCCESS;
 }
 
@@ -638,6 +651,7 @@ TunnelManager::create_l2_vxlan_tunnel(
         return SAI_STATUS_FAILURE;
     }
     sai_ip_address_t src_ip = attr.value.ipaddr;
+    (void)src_ip;  /* Used only for logging; suppress -Wunused-but-set */
 
     // Get dst IP - if missing, this is local VTEP, not P2P tunnel
     attr.id = SAI_TUNNEL_ATTR_ENCAP_DST_IP;
@@ -646,6 +660,7 @@ TunnelManager::create_l2_vxlan_tunnel(
         return SAI_STATUS_SUCCESS;
     }
     sai_ip_address_t dst_ip = attr.value.ipaddr;
+    (void)dst_ip;  /* Used only for logging; suppress -Wunused-but-set */
 
     // Find VNI and VLAN from decap mappers
     uint32_t vni = 0;
@@ -724,67 +739,46 @@ TunnelManager::create_l2_vxlan_tunnel(
     sw_if_index = 0;  // No VPP interface created
 
     /*
-     * Place any L3 VxLAN tunnel with the same src/dst VTEP pair into the
-     * overlay BD (with SHG=1).
+     * Place any existing VxLAN tunnel into the correct overlay BD.
      *
-     * L3 tunnels are created VRF-bound for encap, but VPP's VxLAN decap
-     * defaults to l2-input.  Without explicit BD placement the L3 tunnel
-     * ends up in an auto-assigned BD (e.g. 4096) and decapped packets
-     * can't reach the overlay BVI — causing "BVI L3 mac mismatch" drops.
+     * VPP's vxlan_add_tunnel asynchronously auto-assigns new tunnels to
+     * BD 4096.  The encap path (tunnel_encap_nexthop_action) creates the
+     * tunnel but can't place it in the correct BD because the async BD
+     * assignment hasn't happened yet.  This code runs ~10-15s later,
+     * after VPP has fully initialized the tunnel — the right time to
+     * move it from BD 4096 to the overlay BD.
      *
-     * SHG=1 prevents BUM flooding issues.  Learning is left enabled
-     * (VPP l2_flags API bug causes SIGSEGV).
+     * We use m_tunnel_encap_nexthop_map (populated by the encap path)
+     * to find tunnel sw_if_index values.
      */
     if (vlan_id != 0)
     {
-        for (auto& l3_pair : m_l3_tunnel_map)
+        std::set<uint32_t> placed_tunnels;
+        for (const auto& pair : m_tunnel_encap_nexthop_map)
         {
-            auto& l3_data = l3_pair.second;
+            uint32_t tun_sw_if = pair.second.sw_if_index;
+            if (tun_sw_if == 0 || placed_tunnels.count(tun_sw_if))
+                continue;
+            placed_tunnels.insert(tun_sw_if);
 
-            /* Match by src/dst VTEP IPs (L3 and L2 tunnels share the same
-             * VTEP pair but use different VNIs) */
-            bool src_match = false, dst_match = false;
+            /* Remove from auto-assigned BD 4096, then place in correct BD */
+            set_sw_interface_l2_bridge_by_index_with_shg(
+                tun_sw_if, 4096, false, VPP_API_PORT_TYPE_NORMAL, 0);
 
-            if (src_ip.addr_family == l3_data.src_ip.addr_family)
+            int bd_status = set_sw_interface_l2_bridge_by_index_with_shg(
+                tun_sw_if, vlan_id, true, VPP_API_PORT_TYPE_NORMAL, 0);
+
+            if (bd_status == 0)
             {
-                if (src_ip.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
-                {
-                    src_match = (memcmp(&src_ip.addr.ip4,
-                                        &l3_data.src_ip.addr.ip4, 4) == 0);
-                    dst_match = (memcmp(&dst_ip.addr.ip4,
-                                        &l3_data.dst_ip.addr.ip4, 4) == 0);
-                }
-                else
-                {
-                    src_match = (memcmp(&src_ip.addr.ip6,
-                                        &l3_data.src_ip.addr.ip6, 16) == 0);
-                    dst_match = (memcmp(&dst_ip.addr.ip6,
-                                        &l3_data.dst_ip.addr.ip6, 16) == 0);
-                }
+                SWSS_LOG_NOTICE("Placed VxLAN tunnel sw_if %u into BD %u "
+                                "for decap path (moved from BD 4096)",
+                                tun_sw_if, vlan_id);
             }
-
-            if (src_match && dst_match)
+            else
             {
-                const uint32_t l3_shg = 1;
-                int l3_status = set_sw_interface_l2_bridge_by_index_with_shg(
-                    l3_data.sw_if_index, vlan_id, true,
-                    VPP_API_PORT_TYPE_NORMAL, l3_shg);
-
-                if (l3_status == 0)
-                {
-                    SWSS_LOG_NOTICE("Placed L3 tunnel sw_if %u (VNI=%u) "
-                                    "into BD %u with SHG=%u for decap path",
-                                    l3_data.sw_if_index, l3_data.vni,
-                                    vlan_id, l3_shg);
-                }
-                else
-                {
-                    SWSS_LOG_ERROR("Failed to place L3 tunnel sw_if %u "
-                                   "into BD %u (status=%d)",
-                                   l3_data.sw_if_index, vlan_id, l3_status);
-                }
-                /* Only one L3 tunnel per src/dst pair */
-                break;
+                SWSS_LOG_ERROR("Failed to place VxLAN tunnel sw_if %u "
+                               "into BD %u (status=%d)",
+                               tun_sw_if, vlan_id, bd_status);
             }
         }
     }
