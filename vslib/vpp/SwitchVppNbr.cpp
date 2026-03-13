@@ -14,6 +14,7 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <dirent.h>
 
 #include "vppxlate/SaiVppXlate.h"
 
@@ -272,26 +273,41 @@ sai_status_t SwitchVpp::addRemoveIpNbr(
                     }
 
                     /*
-                     * Also program the neighbor on Vlan<N> (SONiC SVI) so
-                     * FRR's zebra can see it and advertise EVPN Type-2 MAC/IP
-                     * routes.  FRR watches Vlan<N> (not bvivlan<N>) for EVPN
-                     * neighbor state.
+                     * Also program the neighbor on all Vlan interfaces in
+                     * the system so FRR's zebra can see it and advertise
+                     * EVPN Type-2 MAC/IP routes.  FRR maps VNI→Vlan (e.g.,
+                     * VNI 3000 → Vlan3000), so the neighbor must exist on
+                     * the VNI-named VLAN, not just Vlan<bd_id>.
+                     * Enumerate /sys/class/net/Vlan* to cover all SVIs.
                      */
-                    char svi_ifname[32];
-                    snprintf(svi_ifname, sizeof(svi_ifname), "Vlan%u", bd_id);
+                    {
+                        DIR *d = opendir("/sys/class/net");
+                        if (d)
+                        {
+                            struct dirent *ent;
+                            while ((ent = readdir(d)) != NULL)
+                            {
+                                if (strncmp(ent->d_name, "Vlan", 4) != 0) continue;
+                                /* Skip bvivlan* (starts lowercase 'b') */
+                                char svi_ifname[IF_NAMESIZE];
+                                snprintf(svi_ifname, sizeof(svi_ifname), "%.15s", ent->d_name);
 
-                    snprintf(cmd, sizeof(cmd),
-                             "ip neigh replace %s lladdr %s dev %s nud reachable",
-                             ip_str, mac_str, svi_ifname);
+                                snprintf(cmd, sizeof(cmd),
+                                         "ip neigh replace %s lladdr %s dev %s nud reachable",
+                                         ip_str, mac_str, svi_ifname);
 
-                    if (system(cmd) == 0) {
-                        SWSS_LOG_NOTICE("BD %d: programmed kernel neighbor on %s "
-                                        "(%s -> %s) for FRR EVPN Type-2 MAC/IP",
-                                        bd_id, svi_ifname, ip_str, mac_str);
-                    } else {
-                        SWSS_LOG_WARN("BD %d: failed to program kernel neighbor "
-                                      "on %s (%s -> %s)", bd_id, svi_ifname,
-                                      ip_str, mac_str);
+                                if (system(cmd) == 0) {
+                                    SWSS_LOG_NOTICE("BD %d: programmed kernel neighbor on %s "
+                                                    "(%s -> %s) for FRR EVPN Type-2 MAC/IP",
+                                                    bd_id, svi_ifname, ip_str, mac_str);
+                                } else {
+                                    SWSS_LOG_DEBUG("BD %d: skipped kernel neighbor on %s "
+                                                   "(%s -> %s)", bd_id, svi_ifname,
+                                                   ip_str, mac_str);
+                                }
+                            }
+                            closedir(d);
+                        }
                     }
                 }
             }
@@ -453,6 +469,146 @@ sai_status_t SwitchVpp::removeIpNbr(
     }
 
     CHECK_STATUS(remove_internal(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, serializedObjectId));
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchVpp::updateNeighborEntry(
+        _In_ const std::string &serializedObjectId,
+        _In_ const sai_attribute_t* attr)
+{
+    SWSS_LOG_ENTER();
+
+    if (attr->id != SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS)
+    {
+        return set_internal(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, serializedObjectId, attr);
+    }
+
+    sai_neighbor_entry_t nbr_entry;
+    sai_deserialize_neighbor_entry(serializedObjectId, nbr_entry);
+
+    sai_mac_t new_mac;
+    memcpy(new_mac, attr->value.mac, sizeof(sai_mac_t));
+
+    char mac_str[18];
+    snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+             new_mac[0], new_mac[1], new_mac[2],
+             new_mac[3], new_mac[4], new_mac[5]);
+
+    SWSS_LOG_NOTICE("Updating neighbor MAC for %s to %s",
+                    serializedObjectId.c_str(), mac_str);
+
+    /* Update the ASIC_DB entry first */
+    CHECK_STATUS(set_internal(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, serializedObjectId, attr));
+
+    /* Check if this is a BVI neighbor (overlay VLAN RIF) — if so,
+     * update VPP ip neighbor and arp-term with the new (real) MAC.
+     * This handles the case where HW FRR pre-created the neighbor with
+     * the anycast MAC, and now the real server MAC has been learned. */
+    sai_object_id_t rif_oid = nbr_entry.rif_id;
+    sai_attribute_t rif_attr;
+    rif_attr.id = SAI_ROUTER_INTERFACE_ATTR_TYPE;
+
+    if (get(SAI_OBJECT_TYPE_ROUTER_INTERFACE, sai_serialize_object_id(rif_oid),
+            1, &rif_attr) == SAI_STATUS_SUCCESS &&
+        rif_attr.value.s32 == SAI_ROUTER_INTERFACE_TYPE_VLAN)
+    {
+        /* Get the BD ID (VLAN ID) */
+        rif_attr.id = SAI_ROUTER_INTERFACE_ATTR_VLAN_ID;
+        if (get(SAI_OBJECT_TYPE_ROUTER_INTERFACE, sai_serialize_object_id(rif_oid),
+                1, &rif_attr) != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_WARN("updateNeighborEntry: failed to get VLAN ID for RIF");
+            return SAI_STATUS_SUCCESS;  // ASIC_DB already updated
+        }
+
+        auto vlan_obj = get_sai_object(SAI_OBJECT_TYPE_VLAN,
+            sai_serialize_object_id(rif_attr.value.oid));
+        if (!vlan_obj)
+        {
+            SWSS_LOG_WARN("updateNeighborEntry: VLAN object not found");
+            return SAI_STATUS_SUCCESS;
+        }
+
+        sai_attribute_t vlan_attr;
+        vlan_attr.id = SAI_VLAN_ATTR_VLAN_ID;
+        if (vlan_obj->get_attr(vlan_attr) != SAI_STATUS_SUCCESS)
+        {
+            return SAI_STATUS_SUCCESS;
+        }
+        uint16_t vlan_id = vlan_attr.value.u16;
+        char bvi_ifname[32];
+        snprintf(bvi_ifname, sizeof(bvi_ifname), "bvi%u", vlan_id);
+
+        /* Get the SVI MAC to check if old MAC was the anycast MAC */
+        sai_attribute_t svi_attr;
+        svi_attr.id = SAI_ROUTER_INTERFACE_ATTR_SRC_MAC_ADDRESS;
+        sai_mac_t svi_mac = {};
+        if (get(SAI_OBJECT_TYPE_ROUTER_INTERFACE, sai_serialize_object_id(rif_oid),
+                1, &svi_attr) == SAI_STATUS_SUCCESS)
+        {
+            memcpy(svi_mac, svi_attr.value.mac, sizeof(sai_mac_t));
+        }
+
+        bool is_real_mac = (memcmp(new_mac, svi_mac, sizeof(sai_mac_t)) != 0);
+        if (is_real_mac)
+        {
+            init_vpp_client();
+
+            /* Update VPP ip neighbor with real MAC (static) */
+            switch (nbr_entry.ip_address.addr_family) {
+            case SAI_IP_ADDR_FAMILY_IPV4:
+            {
+                struct sockaddr_in sin;
+                sin.sin_family = AF_INET;
+                sin.sin_addr.s_addr = nbr_entry.ip_address.addr.ip4;
+                ip4_nbr_add_del(bvi_ifname, ~0, &sin, true/*is_static*/,
+                                true/*no_fib_entry*/, new_mac, true/*is_add*/);
+
+                char ip_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &sin.sin_addr, ip_str, sizeof(ip_str));
+                SWSS_LOG_NOTICE("updateNeighborEntry: updated VPP ip neighbor on %s: "
+                                "%s → %s (static)", bvi_ifname, ip_str, mac_str);
+                break;
+            }
+            case SAI_IP_ADDR_FAMILY_IPV6:
+            {
+                struct sockaddr_in6 sin6;
+                sin6.sin6_family = AF_INET6;
+                memcpy(sin6.sin6_addr.s6_addr, nbr_entry.ip_address.addr.ip6,
+                       sizeof(sin6.sin6_addr.s6_addr));
+                ip6_nbr_add_del(bvi_ifname, ~0, &sin6, true/*is_static*/,
+                                true/*no_fib_entry*/, new_mac, true/*is_add*/);
+                SWSS_LOG_NOTICE("updateNeighborEntry: updated VPP ip6 neighbor on %s → %s (static)",
+                                bvi_ifname, mac_str);
+                break;
+            }
+            }
+
+            /* Also update BD arp-term entry with real MAC.
+             * The initial addIpNbr programmed arp-term with SVI (anycast) MAC
+             * for proxy ARP. Now that we know the real server MAC, update the
+             * arp-term table so ARP replies carry the real MAC. */
+            switch (nbr_entry.ip_address.addr_family) {
+            case SAI_IP_ADDR_FAMILY_IPV4:
+                bd_ip_mac_add_del(vlan_id, AF_INET,
+                                  &nbr_entry.ip_address.addr.ip4,
+                                  sizeof(nbr_entry.ip_address.addr.ip4),
+                                  new_mac, true/*is_add*/);
+                SWSS_LOG_NOTICE("updateNeighborEntry: updated BD %u arp-term for %s → %s",
+                                vlan_id, serializedObjectId.c_str(), mac_str);
+                break;
+            case SAI_IP_ADDR_FAMILY_IPV6:
+                bd_ip_mac_add_del(vlan_id, AF_INET6,
+                                  nbr_entry.ip_address.addr.ip6,
+                                  sizeof(nbr_entry.ip_address.addr.ip6),
+                                  new_mac, true/*is_add*/);
+                SWSS_LOG_NOTICE("updateNeighborEntry: updated BD %u arp-term (IPv6) → %s",
+                                vlan_id, mac_str);
+                break;
+            }
+        }
+    }
 
     return SAI_STATUS_SUCCESS;
 }

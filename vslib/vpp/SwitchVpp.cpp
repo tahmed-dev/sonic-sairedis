@@ -1558,6 +1558,12 @@ sai_status_t SwitchVpp::set(
         return setNexthopGroupMember(serializedObjectId, attr);
     }
 
+    if (objectType == SAI_OBJECT_TYPE_NEIGHBOR_ENTRY &&
+        attr->id == SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS)
+    {
+        return updateNeighborEntry(serializedObjectId, attr);
+    }
+
     return set_internal(objectType, serializedObjectId, attr);
 }
 
